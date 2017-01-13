@@ -41,9 +41,9 @@
 $import "/capnp/c++.capnp".namespace("sandstorm");
 
 using Util = import "util.capnp";
-using PowerboxCapability = import "grain.capnp".PowerboxCapability;
+using SystemPersistent = import "supervisor.capnp".SystemPersistent;
 
-interface IpNetwork extends(PowerboxCapability) {
+interface IpNetwork @0xa982576b7a2a2040 {
   # Capability to connect or send messages to arbitrary destinations on an IP network.
   #
   # A driver app can request this from the Powerbox in order to request "full outbound network
@@ -76,7 +76,7 @@ struct IpAddress {
   #     dest.setUpper64(0);
 }
 
-interface IpInterface extends(PowerboxCapability) {
+interface IpInterface @0xe32c506ee93ed6fa {
   # Capability to accept connections / messages on a particular network interface.
   #
   # In practice this could represent a single physical network interface, a single local IP
@@ -96,7 +96,7 @@ interface IpInterface extends(PowerboxCapability) {
   # sent to the port.
 }
 
-interface IpRemoteHost extends(PowerboxCapability) {
+interface IpRemoteHost @0x905dd76b298b3130 {
   # Capability to connect / send messages to a particular remote host accessed over an IP network.
   #
   # A driver app can request this form the Powerbox in order to request "permission to connect to
@@ -113,7 +113,7 @@ interface IpRemoteHost extends(PowerboxCapability) {
   getUdpPort @1 (portNum :UInt16) -> (port :UdpPort);
 }
 
-interface TcpPort extends(PowerboxCapability) {
+interface TcpPort @0xeab20e1af07806b4 {
   # Capability to connect to a remote network port.
   #
   # An application may request a TcpPort from the Powerbox in order to request permission to
@@ -132,7 +132,7 @@ interface TcpPort extends(PowerboxCapability) {
   # bytes via pipelining immediately.
 }
 
-interface UdpPort extends(PowerboxCapability) {
+interface UdpPort @0xc6212e1217d001ce {
   # Like `TcpPort` but for datagrams.
 
   send @0 (message :Data, returnPort :UdpPort);
@@ -182,3 +182,6 @@ struct IpPortPowerboxMetadata {
   # asking the user for a hostname at all and instead making the Powerbox request right off and
   # letting the user specify the hostname there.
 }
+
+interface PersistentIpNetwork extends (IpNetwork, SystemPersistent) {}
+interface PersistentIpInterface extends (IpInterface, SystemPersistent) {}

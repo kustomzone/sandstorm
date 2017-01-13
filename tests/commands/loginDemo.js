@@ -25,13 +25,16 @@ exports.command = function(callback) {
     .url(this.launchUrl + "/demo")
     .execute('window.Meteor.logout()')
     .pause(short_wait)
-    .click("#createDemoUser")
-    .waitForElementVisible('#applist-apps', medium_wait);
+    .waitForElementVisible(".demo-startup-modal .start", medium_wait)
+    .click(".demo-startup-modal .start")
+    .url(this.launch_url + "/apps")
+    .waitForElementVisible('.app-list', medium_wait)
+    .resizeWindow(utils.default_width, utils.default_height);
 
   this.sandstormAccount = 'demo';
   if (typeof callback === "function") {
-    return ret.click("#applist-apps > ul > li:nth-child(1)", callback);
+    return ret.status(callback);
   } else {
-    return ret.click("#applist-apps > ul > li:nth-child(1)");
+    return ret;
   }
 };

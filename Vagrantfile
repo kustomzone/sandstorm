@@ -5,11 +5,8 @@
 VAGRANTFILE_API_VERSION = "2"
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
-  # We base ourselves off the trusty (Ubuntu 14.04) base box.
-  config.vm.box = "trusty64"
-
-  # The url from which to fetch that base box.
-  config.vm.box_url = "https://cloud-images.ubuntu.com/vagrant/trusty/current/trusty-server-cloudimg-amd64-vagrant-disk1.box"
+  # We base ourselves off a Debian fork of the official Debian jessie64 base box.
+  config.vm.box = "sandstorm/debian-jessie64"
 
   # We forward port 6080, the Sandstorm web port, so that developers can
   # visit their sandstorm app from their browser as local.sandstorm.io:6080
@@ -22,14 +19,10 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   # work.
   config.vm.network :private_network, ip: "169.254.254.2"
 
-  # Use a shell script to "provision" the box. This install Sandstorm using
+  # Use a shell script to "provision" the box. This installs Sandstorm using
   # the bundled installer.
   config.vm.provision "shell",
-    inline: "cd /vagrant && echo localhost > /etc/hostname && hostname localhost && sudo ./install.sh -d -e"
-
-  # Make the vagrant user part of the sandstorm group so that commands like
-  # `spk dev` work.
-  config.vm.provision "shell", inline: "usermod -a -G 'sandstorm' 'vagrant'"
+    inline: "cd /vagrant && echo localhost > /etc/hostname && hostname localhost && sudo OVERRIDE_DEFAULT_SERVER_USER=vagrant ./install.sh -d -e > /dev/null && sudo sed --in-place='' --expression='s/^BIND_IP=.*/BIND_IP=0.0.0.0/' /opt/sandstorm/sandstorm.conf && sudo service sandstorm restart && printf '\nYour server is online. It has the dev accounts feature enabled, so anyone can log in.\n\nDetails and customization instructions are available here:\n- https://github.com/sandstorm-io/sandstorm/wiki/Using-the-Vagrantfile\n\nVisit it at:\n  http://local.sandstorm.io:6080/'"
 
   # Use NFS for the /vagrant shared directory, for performance and
   # compatibility.
@@ -47,6 +40,13 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   elsif host =~ /linux/
     cpus = `nproc`.to_i
     total_kB_ram = `grep MemTotal /proc/meminfo | awk '{print $2}'`.to_i
+  elsif host =~ /mingw/
+    # powershell may not be available on Windows XP and Vista, so wrap this in a rescue block
+    begin
+      cpus = `powershell -Command "(Get-WmiObject Win32_Processor -Property NumberOfLogicalProcessors | Select-Object -Property NumberOfLogicalProcessors | Measure-Object NumberOfLogicalProcessors -Sum).Sum"`.to_i
+      total_kB_ram = `powershell -Command "Get-CimInstance -class cim_physicalmemory | % {$_.Capacity}"`.to_i / 1024
+    rescue
+    end
   end
 
   # Use the same number of CPUs within Vagrant as the system, with 1
@@ -58,17 +58,73 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   # RAM entirely (which it basically would if we went much lower than
   # 512MB) and also allowing it to use up a healthily large amount of
   # RAM so it can run faster on systems that can afford it.
-  config.vm.provider :virtualbox do |vb|
-    if cpus.nil?
-      vb.cpus = 1
-    else
-      vb.cpus = cpus
-    end
+  assign_cpus = nil
+  assign_ram_mb = nil
+  if cpus.nil? or cpus.zero?
+    assign_cpus = 1
+  else
+    assign_cpus = cpus
+  end
+  if total_kB_ram.nil? or total_kB_ram < 2048000
+    assign_ram_mb = 512
+  else
+    assign_ram_mb = (total_kB_ram / 1024 / 4)
+  end
 
-    if total_kB_ram.nil? or total_kB_ram < 2048000
-      vb.memory = 512
-    else
-      vb.memory = (total_kB_ram / 1024 / 4)
-    end
+  # Actually provide the computed CPUs/memory to the backing provider.
+  config.vm.provider :virtualbox do |vb|
+    vb.cpus = assign_cpus
+    vb.memory = assign_ram_mb
+  end
+  config.vm.provider :libvirt do |libvirt|
+    libvirt.cpus = assign_cpus
+    libvirt.memory = assign_ram_mb
   end
 end
+
+### If you're on Windows, and you want to SMB share the
+### /home/vagrant directory in the guest with your Windows
+### machines, run "vagrant ssh" then do the following:
+###
+### sudo apt-get install samba pwgen
+###
+### Then sudo nano -w /etc/samba/smb.conf and make it contain the
+### following, only remove the ### from the beginning of every line.
+###
+### [global]
+### workgroup = WORKGROUP
+### dns proxy = no
+### bind interfaces only = no
+### syslog only = yes
+### syslog = 1
+### server role = standalone server
+### passdb backend = tdbsam
+### obey pam restrictions = yes
+### unix password sync = no
+### pam password change = no
+### map to guest = bad user
+### usershare allow guests = no
+###
+### [vagranthome]
+### comment = Vagrant home
+### browseable = yes
+### create mask = 0750
+### directory mask = 0700
+### read only = no
+### valid users = vagrant
+### path = /home/vagrant
+###
+### Then set a password for the vagrant user on Linux and enable it for
+### samba use by running:
+###
+### pwgen -1  # generate a password
+###
+### sudo passwd vagrant
+### sudo smbpasswd -a vagrant
+###
+### Then restart the VM via "vagrant reload" and visit
+###
+### \\169.254.254.2\vagranthome
+###
+### and log in with username vagrant (and password whatever
+### you set above).

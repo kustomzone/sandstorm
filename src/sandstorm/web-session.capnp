@@ -16,7 +16,8 @@
 
 @0xa8cb0f2f1a756b32;
 
-$import "/capnp/c++.capnp".namespace("sandstorm");
+using Cxx = import "/capnp/c++.capnp";
+$Cxx.namespace("sandstorm");
 
 using Grain = import "grain.capnp";
 using Util = import "util.capnp";
@@ -54,16 +55,24 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
     # TODO(soon):  Support utility factor (e.g. ";q=0.7").
   }
 
-  get @0 (path :Text, context :Context) -> Response;
+  get @0 (path :Text, context :Context, ignoreBody :Bool) -> Response;
+  # GET or HEAD request.
+  #
+  # If `ignoreBody` is true, then the caller intends to ignore any content body returned. The
+  # caller may choose to return an empty body. (This is used e.g. for HEAD requests.)
+
   post @1 (path :Text, content :PostContent, context :Context) -> Response;
   put @3 (path :Text, content :PutContent, context :Context) -> Response;
   delete @4 (path :Text, context :Context) -> Response;
+  patch @17 (path :Text, content :PostContent, context :Context) -> Response;
 
-  postStreaming @5 (path :Text, mimeType :Text, context :Context, encoding :Text) -> (stream :RequestStream);
-  putStreaming @6 (path :Text, mimeType :Text, context :Context, encoding :Text) -> (stream :RequestStream);
-  # Streaming post/put requests, useful when the input is large. If these throw `unimplemented` exceptions,
-  # the caller should fall back to regular post() / put() on the assumption that the app doesn't
-  # implement streaming.
+  postStreaming @5 (path :Text, mimeType :Text, context :Context, encoding :Text)
+      -> (stream :RequestStream);
+  putStreaming @6 (path :Text, mimeType :Text, context :Context, encoding :Text)
+      -> (stream :RequestStream);
+  # Streaming post/put requests, useful when the input is large. If these throw `unimplemented`
+  # exceptions, the caller should fall back to regular post() / put() on the assumption that the
+  # app doesn't implement streaming.
   #
   # The optional `encoding` field represents the Content-Encoding header.
 
@@ -74,7 +83,29 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
   # `clientStream` is the capability which will receive server -> client messages, while
   # serverStream represents client -> server.
 
-  # TODO(someday): Add WebDAV and CalDAV methods?
+  propfind @7 (path :Text, xmlContent :Text, depth :PropfindDepth, context :Context) -> Response;
+  proppatch @8 (path :Text, xmlContent :Text, context :Context) -> Response;
+  mkcol @9 (path :Text, content :PostContent, context :Context) -> Response;
+  copy @10 (path :Text, destination :Text, noOverwrite :Bool,
+            shallow :Bool, context :Context) -> Response;
+  move @11 (path :Text, destination :Text, noOverwrite :Bool, context :Context) -> Response;
+  lock @12 (path :Text, xmlContent :Text, shallow :Bool, context :Context) -> Response;
+  unlock @13 (path :Text, lockToken :Text, context :Context) -> Response;
+  acl @14 (path :Text, xmlContent :Text, context :Context) -> Response;
+  report @15 (path :Text, content :PostContent, context :Context) -> Response;
+  # WebDAV methods
+  #
+  # "destination" is a *path*, but *not* a URI -- the origin is stripped, and there is no leading
+  #   '/', just like with the `path` parameter.
+  # "shallow = true" means "Depth: 0"
+  # "noOverwrite = true" means "Overwrite: F"; note that this behaves a precondition -- if the
+  #   destination already exists then a preconditionFailed response is returned.
+  #
+  # (These boolean flags were intentionally chosen so that the spec-defined default values are
+  # false.)
+
+  options @16 (path :Text, context :Context) -> Options;
+  # OPTIONS request.
 
   struct Context {
     # Additional per-request context.
@@ -95,18 +126,68 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
 
     accept @2 :List(AcceptedType);
     # This corresponds to the Accept header
+
+    acceptEncoding @9 :List(AcceptedEncoding);
+    # This corresponds to the Accept-Encoding header
+
+    eTagPrecondition :union {
+      none @4 :Void;  # No precondition.
+      exists @5 :Void;  # If-Match: *
+      doesntExist @8 :Void;  # If-None-Match: *
+      matchesOneOf @6 :List(ETag);  # If-Match
+      matchesNoneOf @7 :List(ETag);  # If-None-Match
+    }
+
+    additionalHeaders @3 :List(Header);
+    # Additional headers present in the request. Only whitelisted headers are
+    # permitted.
+
+    struct Header {
+      name @0 :Text;  # lower-cased name
+      value @1 :Text;
+    }
+
+    const headerWhitelist :List(Text) = [
+      # Non-standard request headers which are whitelisted for backwards-compatibility
+      # purposes. This whitelist exists to help avoid the need to modify code originally written
+      # without Sandstorm in mind -- especially to avoid modifying client apps. Feel free
+      # to send us pull requests adding additional headers.
+      # Values in this list that end with '*' whitelist a prefix.
+
+      "x-sandstorm-app-*",     # For new headers introduced by Sandstorm apps.
+
+      "oc-total-length",       # Owncloud client
+      "oc-chunk-size",         # Owncloud client
+      "x-oc-mtime",            # Owncloud client
+      "oc-fileid",             # Owncloud client
+      "oc-chunked",            # Owncloud client
+      "x-hgarg-*",             # Mercurial client
+      "x-phabricator-*",       # Phabricator
+      "x-requested-with",      # JQuery header used by Rails and other frameworks
+    ];
   }
 
   struct PostContent {
+    # TODO(apibump): Rename this to just `Content` or maybe `RequestContent`.
+
     mimeType @0 :Text;
     content @1 :Data;
     encoding @2 :Text;  # Content-Encoding header (optional).
   }
 
   struct PutContent {
+    # TODO(apibump): Remove this and replace it with `PostContent` (renamed to `Content`).
+
     mimeType @0 :Text;
     content @1 :Data;
     encoding @2 :Text;  # Content-Encoding header (optional).
+  }
+
+  struct ETag {
+    value @0 :Text;  # does not include quotes
+    weak @1 :Bool;
+    # denotes that the resource may not be byte-for-byte identical, but is
+    # semantically equivalent
   }
 
   struct Cookie {
@@ -133,8 +214,19 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
     qValue @1 :Float32 = 1;
   }
 
+  struct AcceptedEncoding {
+    # The Accept-Encoding header contains a list of valid content codings.
+    # Each content coding could be "*", indicating an arbitrary encoding.
+    # Each content coding comes with a qValue, defaulting to 1.
+    # For example, gzip;q=0.5 indicates the "gzip" coding with qValue "0.5"
+
+    contentCoding @0 :Text;
+    qValue @1 :Float32 = 1;
+  }
+
   struct Response {
     setCookies @0 :List(Cookie);
+    cachePolicy @16 :CachePolicy;
 
     enum SuccessCode {
       # 2xx-level status codes that we allow an app to return.
@@ -151,12 +243,16 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
       created  @1 $httpStatus(id = 201, title = "Created");
       accepted @2 $httpStatus(id = 202, title = "Accepted");
 
+      noContent      @3 $httpStatus(id = 204, title = "No Content");
+      partialContent @4 $httpStatus(id = 206, title = "Partial Content");
+      multiStatus    @5 $httpStatus(id = 207, title = "Multi-Status");
+
+      # This seems to fit better here than in the 3xx range
+      notModified    @6 $httpStatus(id = 304, title = "Not Modified");
+
       # Not applicable:
       #   203 Non-Authoritative Information:  Only applicable to proxies?
-      #   204 No Content:  Meant for old form-based interaction.  Obsolete.  Seems like bad UX, too.
-      #     If desired, should be handled differently because there should be no entity body.
       #   205 Reset Content:  Like 204, but even stranger.
-      #   206 Partial Content:  Range requests not implemented yet.
       #   Others:  Not standard.
     }
 
@@ -177,10 +273,12 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
       notAcceptable         @4 $httpStatus(id = 406, title = "Not Acceptable");
       conflict              @5 $httpStatus(id = 409, title = "Conflict");
       gone                  @6 $httpStatus(id = 410, title = "Gone");
+      preconditionFailed   @11 $httpStatus(id = 412, title = "Precondition Failed");
       requestEntityTooLarge @7 $httpStatus(id = 413, title = "Request Entity Too Large");
       requestUriTooLong     @8 $httpStatus(id = 414, title = "Request-URI Too Long");
       unsupportedMediaType  @9 $httpStatus(id = 415, title = "Unsupported Media Type");
       imATeapot            @10 $httpStatus(id = 418, title = "I'm a teapot");
+      unprocessableEntity  @12 $httpStatus(id = 422, title = "Unprocessable Entity");
 
       # Not applicable:
       #   401 Unauthorized:  We don't do HTTP authentication.
@@ -205,6 +303,11 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
         language @3 :Text;  # Content-Language header (optional).
         mimeType @4 :Text;  # Content-Type header.
 
+        eTag @17 :ETag;
+        # Optional entity tag for this content. This can be used to express preconditions on future
+        # requests, useful for implementing, for example, cache validation (on GETs) and optimistic
+        # concurrency (on PUTs). See `eTagPrecondition` in `WebSession.Context`.
+
         body :union {
           bytes @5 :Data;
 
@@ -225,6 +328,25 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
         shouldResetForm @15 :Bool;
         # If this is the response to a form submission, should the form be reset to empty?
         # Distinguishes between HTTP response 204 (False) and 205 (True)
+
+        eTag @19 :ETag;
+        # Optional entity tag header. Server can send this in a response to a modifying request
+        # to indicate for example the new version of the modified resource.
+      }
+
+      preconditionFailed :group {
+        # One of the preconditions specified in the request context was not met.
+        #
+        # If the request was a GET or HEAD and the precodition was If-None-Match, then this response
+        # corresponds to HTTP 304 "Not Modified". In all other ctases, this response corresponds to
+        # HTTP 412 "Precondition Failed". (We unify these two HTTP status codes because they really
+        # mean the same thing and should be implemented by the same code.)
+
+        matchingETag @18 :ETag;
+        # If the precondition failed because the etag matched a tag specified in `matchesNoneOf`,
+        # this is the tag that it matched. For other types of preconditions, this is null.
+        #
+        # (This is in particular used for GET requests where the result is "304 not modified".)
       }
 
       redirect :group {
@@ -270,6 +392,28 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
       # TODO(someday):  Return blob directly from storage, so data doesn't have to stream through
       #   the app?
     }
+
+    additionalHeaders @20 :List(Header);
+    # Additional headers present in the reponse. Only whitelisted headers are
+    # permitted.
+
+    struct Header {
+      name @0 :Text;  # lower-cased name
+      value @1 :Text;
+    }
+
+    const headerWhitelist :List(Text) = [
+      # Non-standard response headers which are whitelisted for backwards-compatibility
+      # purposes. This whitelist exists to help avoid the need to modify code originally written
+      # without Sandstorm in mind -- especially to avoid modifying client apps.
+      # Feel free to send us pull requests adding additional headers.
+      # Values in this list that end with '*' whitelist a prefix.
+
+      "x-sandstorm-app-*",     # For new headers introduced by Sandstorm apps.
+
+      "x-oc-mtime",            # Owncloud protocol
+    ];
+
   }
 
   interface RequestStream extends(Util.ByteStream) {
@@ -299,6 +443,69 @@ interface WebSession @0xa50711a14d35a8ce extends(Grain.UiSession) {
     # datagram at a time.
     #
     # TODO(soon):  Send whole WebSocket datagrams.
+  }
+
+  struct CachePolicy {
+    enum Scope {
+      # Defines the scope in which caching is allowed. For security reasons, the resource MUST NOT
+      # be stored in a cache with a broader scope, even if it is never actually served from that
+      # cache.
+
+      none @0;
+      # This resource must not be stored in any cache.
+
+      perSession @1;
+      # Caching is allowed on a per-session basis.
+
+      perUser @2;
+      # Caching is allowed on a per-user basis (across multiple sessions).
+
+      perAppVersion @3;
+      # Caching is allowed on a per-app-version basis (across all users). This is a
+      # Sandstorm-specific notion.
+
+      universal @4;
+      # Caching is allowed universally, across all users and versions of the app.
+    }
+
+    withCheck @0 :Scope;
+    # Within a cache serving this scope or a narrower scope, the resource may be stored in cache,
+    # but if a non-negligible amount of time has gone by since the resource was last validated then
+    # the client must check with the server that the resource hasn't changed (revalidate).
+    #
+    # "A non-negligible amount of time" means something on the order of the network latency between
+    # the client and the server. For example, there is obviously no point in re-validating a cached
+    # resource if it was last validated less than one network round trip ago. For optimization
+    # reasons, we allow this to be expanded a bit -- something like a 15s timeout is OK. Ultimately
+    # it is up to the infrastructure to decide, though; if an app is not OK with this, it should
+    # specify `withCheck` = `none`.
+
+    permanent @1 :Scope;
+    # Within a cache serving this scope or a narrower scope, the resource may be assumed never to
+    # change, and may be served directly from cache without checking with the server.
+    #
+    # Note that we do not allow specification of a cache duration other than "forever" because in
+    # practice if the resource is mutable at all, you almost certainly don't know when it will next
+    # change, and so setting a non-zero cache duration will lead to stale data bugs.
+
+    variesOnCookie @2 :Bool;
+    variesOnAccept @3 :Bool;
+    # Indicates what inputs in `Context` would have caused a different response to be served.
+    # If these are false and caching is enabled, it is assumed the resource is identical regardless
+    # of these inputs.
+  }
+
+  struct Options {
+    davClass1 @0 :Bool = false;
+    davClass2 @1 :Bool = false;
+    davClass3 @2 :Bool = false;
+    davExtensions @3 :List(Text);
+  }
+
+  enum PropfindDepth {
+    infinity @0 $Cxx.name("infinity_");  # INFINITY is a macro in C
+    zero @1;
+    one @2;
   }
 
   # Request headers that we will probably add later:

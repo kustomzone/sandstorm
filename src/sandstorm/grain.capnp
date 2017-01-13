@@ -19,85 +19,9 @@
 $import "/capnp/c++.capnp".namespace("sandstorm");
 
 using Util = import "util.capnp";
-
-# ========================================================================================
-# Powerbox
-#
-# TODO(cleanup):  Put in separate file?  Note that PowerboxCapability must be declared before
-#   UiView due to a bug in Cap'n Proto requiring superclasses to be declared before subclasses.
-#
-# The powerbox is part of the Sandstorm UI which allows users to connect applications to each
-# other.  First, one application must publish a PowerboxCapability to the powerbox via
-# `SandstormApi.publish()`.  Then, a second application may request a capability from the powerbox
-# via `SessionContext.request()`.  The user is presented with a list of capabilities from the
-# powerbox which match the requesting application's query.  The user may select one, which will
-# then be returned to the requesting app.
-#
-# Another way to connect apps is via actions.  One application may declare that it can implement
-# some action on any capability matching a particular query.  Another application may later use
-# SessionContext.offer() to offer a specific capability to the current user.  The user will be
-# presented with a list of actions that make sense for that capability and may select one.  (This
-# is much like Android intents.)
-
-interface PowerboxCapability {
-  # Capabilities to be offered to the powerbox must implement PowerboxCapability (in addition to
-  # the interface for the application functionality they provide).  PowerboxCapability provides
-  # metadata about the capability for display in the powerbox UI as well as the sharing graph
-  # (which shows inter-app capabilities).
-  #
-  # Capabilities sent directly between two grains (e.g. as an RPC parameter) rather than through
-  # the powerbox UI may also wish to implement PowerboxCapability in order to improve the sharing
-  # graph visualization.  Only persisted capabilities will ever show up in the visualization.
-
-  getPowerboxInfo @0 () -> PowerboxInfo;
-  struct PowerboxInfo {
-    title @0 :Util.LocalizedText;
-    # Title for this capability if displayed as an option in the powerbox.  Useful for
-    # distinguishing from other capabilities exported by the same grain.  Leave blank if the
-    # capability effectively represents the entire grain and so should just take the grain's title.
-    #
-    # Titles are suggestions only.  The user may override the title with their own.
-
-    verbPhrase @1 :Util.LocalizedText;
-    # Verb phrase describing what the holder of this capability can do to the grain, e.g.
-    # "can edit".  This may be displayed in the sharing UI to describe a connection between two
-    # grains.
-
-    description @2 :Util.LocalizedText;
-    # Long-form description of what the capability represents.  Should be roughly a paragraph that
-    # could be displayed e.g. in a tooltip.
-
-    interfaces @3 :List(UInt64);
-    # Type IDs of Cap'n Proto interfaces implemented by this capability.  Only interfaces which
-    # should be used for powerbox searching/matching purposes need to be listed.  Superclasses
-    # must be listed explicitly if they should be considered for matching.  The powerbox does not
-    # know anything about the actual interface schemas; it just matches the IDs.
-
-    # TODO(someday):  Icon.
-    # TODO(someday):  Other match criteria.
-  }
-}
-
-interface PowerboxAction {
-  apply @0 (cap: PowerboxCapability) -> (view :UiView);
-  # Invoke the action on the given capability, producing a view which is displayed to the user.
-}
-
-struct PowerboxQuery {
-  # When the app requests a capability from the powerbox, it provides a PowerboxQuery specifying
-  # what kind of capability it wants, in order to narrow down the options.
-
-  union {
-    conjunction @0 :List(PowerboxQuery);
-    disjunction @1 :List(PowerboxQuery);
-    # Specifies a conjunction (AND) or disjunction (OR) of other queries.
-
-    implements @2 :UInt64;
-    # The capability must list the given interface in `PowerboxInfo.interfaces`.
-
-    # TODO(someday):  Other match criteria.
-  }
-}
+using Powerbox = import "powerbox.capnp";
+using Activity = import "activity.capnp";
+using Identity = import "identity.capnp";
 
 # ========================================================================================
 # Runtime interface
@@ -114,30 +38,13 @@ interface SandstormApi(AppObjectId) {
   # TODO(soon):  Read the grain title as set by the user.  Also have interface to offer a new
   #   title and icon?
 
-  publish @0 (cap :PowerboxCapability, requiredPermissions :PermissionSet)
-          -> (registration :Util.Handle);
-  # Publish the given capability, such that any user who has access to the Grain with at least the
-  # given permissions will see the capability show up in their powerbox for matching searches.
-  #
-  # Returns a handle which, when dropped, un-publishes the capability.  You must save this handle
-  # to storage to keep the capability published.  Dropping the handle does not revoke the
-  # capability, only prevents it from appearing in the powerbox going forward.
+  deprecatedPublish @0 ();
+  deprecatedRegisterAction @1 ();
+  # These powerbox-related methods were never implemented. Eventually it was decided that they
+  # specified the wrong model.
 
-  # TODO(someday):  Let the app publish a picker UI which can be embedded in the powerbox.  For
-  #   example, a music library may want to make each track in the library available via the
-  #   powerbox, but publishing every one may be clunky.  Instead, it might offer a little embedded
-  #   UI which lets the user type a search query or browse by artist.
-
-  registerAction @1 (query :PowerboxQuery, action :PowerboxAction,
-                     requiredPermissions :PermissionSet) -> (registration :Util.Handle);
-  # Register an action implemented by this grain.  It will be offered to the user as an option
-  # whenever another app uses `SessionContext.offer()` to offer a capability that matches the query.
-  #
-  # This method should only be used for actions that are somehow specific to this grain.  This is
-  # unusual.  Usually, you want to define actions in the application's manifest; such actions will
-  # be executed in a newly-created grain.
-
-  shareCap @2 (cap :PowerboxCapability) -> (sharedCap :PowerboxCapability, link :SharingLink);
+  shareCap @2 (cap :Capability, displayInfo :Powerbox.PowerboxDisplayInfo)
+           -> (sharedCap :Capability, link :SharingLink);
   # Share a capability, so that it may safely be sent to another user.  `sharedCap` is a wrapper
   # (membrane) around `cap` which can have a petname assigned and can be revoked via `link`.  The
   # share is automatically revoked if `link` is discarded.  If `cap` is persistable, then both
@@ -191,7 +98,8 @@ interface SandstormApi(AppObjectId) {
   # therefore all references to it may as well be dropped. This affects *incoming* references,
   # whereas `drop()` affects *outgoing*.
 
-  stayAwake @7 (displayInfo :NotificationDisplayInfo, notification :OngoingNotification)
+  stayAwake @7 (displayInfo :Activity.NotificationDisplayInfo,
+                notification :Activity.OngoingNotification)
             -> (handle :Util.Handle);
   # Requests that the app be allowed to continue running in the background, even if no user has it
   # open in their browser. An ongoing notification is delivered to the user who owns the grain to
@@ -207,9 +115,20 @@ interface SandstormApi(AppObjectId) {
   # TODO(someday): We could make `handle` be persistent. If the app persists it -- and if
   #   `notification` is persistent -- we would automatically restart the app after an unexpected
   #   failure.
+
+  backgroundActivity @9 (event :Activity.ActivityEvent);
+  # Post an activity event to the grain's activity log that was *not* initiated by any particular
+  # user. For activity that should be attributed to a user, use SessionContext.activity().
+
+  getIdentityId @10 (identity: Identity.Identity) -> (id :Data);
+  # Gets the ID of the identity, as it would appear in UserInfo.identityId.
+  #
+  # This method is here on `SandstormApi` rather than on `Identity` in order to ease a possible
+  # future transition to a model where identity IDs are not globally stable and each grain has a
+  # separate (possibly incompatible) map from identity ID to account ID.
 }
 
-interface UiView extends(PowerboxCapability) {
+interface UiView @0xdbb4d798ea67e2e7 {
   # Implements a user interface with which a user can interact with the grain.  We call this a
   # "view" because a single grain may actually have multiple "views" that provide different
   # functionality or represent multiple logical objects in the same physical grain.
@@ -221,10 +140,9 @@ interface UiView extends(PowerboxCapability) {
   # It is possible for a grain to export additional views via the usual powerbox mechanisms.  For
   # instance, a spreadsheet app might let the user create a "view" of a few cells of the
   # spreadsheet, allowing them to share those cells to another user without sharing the entire
-  # sheet.  To accomplish this, the app would create an alternate UserInterface object that
-  # implements an interface just to those cells, and then would use `UiSession.offer()` to offer
-  # this object to the user.  The user could then choose to open it, share it, save it for later,
-  # etc.
+  # sheet.  To accomplish this, the app would create an alternate UiView object that implements
+  # an interface just to those cells, and then would use `UiSession.offer()` to offer this object
+  # to the user.  The user could then choose to open it, share it, save it for later, etc.
 
   getViewInfo @0 () -> ViewInfo;
   # Get metadata about the view, especially relating to sharing.
@@ -275,6 +193,14 @@ interface UiView extends(PowerboxCapability) {
     # two UiViews are really the same view with different permissions applied, and can then combine
     # them in the UI as appropriate.
     #
+    # Implementation-wise, in addition to the permissions enumerated here, there is an additional
+    # "is human" pseudopermission provided by the Sandstorm platform, which is invisible to apps,
+    # but affects how UiView capabilities may be used.  In particular, all users are said to possess
+    # the "is human" pseudopermission, whereas all other ApiTokenOwners do not, and by default, the
+    # privilege is not passed on.  All method calls on UiView require that the caller have the "is
+    # human" permission.  In practical terms, this means that grains can pass around UiView
+    # capabilities, but only users can actually use them to open sessions.
+    #
     # It is actually entirely possible to implement a traditional filtering membrane around a
     # UiView, perhaps to implement a kind of access that can't be expressed using the permission
     # bits defined by the app.  But doing so will be awkward, slow, and confusing for all the
@@ -294,7 +220,7 @@ interface UiView extends(PowerboxCapability) {
     # It is important that new versions of the app only add new roles, never remove existing ones,
     # since role IDs are indexes into the list and persist through upgrades.
 
-    deniedPermissions @2 :PermissionSet;
+    deniedPermissions @2 :Identity.PermissionSet;
     # Set of permissions which will be removed from the permission set when creating a new session
     # though this object.  This set should be empty for the grain's main UiView, but when that view
     # is shared with less than full access, recipients will get a proxy UiView which has a non-empty
@@ -305,10 +231,39 @@ interface UiView extends(PowerboxCapability) {
     # Alice has read-only access to a document and wishes to share the document to Bob, the sharing
     # UI should not offer Alice the ability to share write access, because she doesn't have it in
     # the first place.  The sharing UI figures out what Alice has by examining `deniedPermissions`.
+
+    matchRequests @3 :List(Powerbox.PowerboxDescriptor);
+    # Indicates what kinds of powerbox requests this grain may be able to fulfill. If the grain
+    # is chosen by the user during a powerbox request, then `newRequestSession()` will be called
+    # to set up the embedded UI session.
+
+    matchOffers @4 :List(Powerbox.PowerboxDescriptor);
+    # Indicates what kinds of powerbox offers this grain is interested in accepting. If the grain
+    # is chosen by the user during a powerbox offer, then `newOfferSession()` will be called
+    # to start a session around this.
+
+    appTitle @5 :Util.LocalizedText;
+    # Title for the app of which this grain is an instance.
+
+    grainIcon @6 :Util.StaticAsset;
+    # Icon for the app of which this grain is an instance, suitable for display in a grain list.
+
+    eventTypes @7 :List(Activity.ActivityTypeDef);
+    # Definitions of activity event types generated by this grain. Each activity event is tagged
+    # with one of these types. Typed events potentially allow for advanced filtering options and
+    # compact activity summaries.
   }
 
-  newSession @1 (userInfo :UserInfo, context :SessionContext,
-                 sessionType :UInt64, sessionParams :AnyPointer)
+  struct PowerboxTag {
+    # Tag to be used in a `PowerboxDescriptor` to describe a `UiView`.
+
+    title @0 :Text;
+    # The title of the `UiView` as chosen by the introducer identity.
+  }
+
+  newSession @1 (userInfo :Identity.UserInfo, context :SessionContext,
+                 sessionType :UInt64, sessionParams :AnyPointer,
+                 tabId :Data)
              -> (session :UiSession);
   # Start a new user interface session.  This happens when a user first opens the view, or when
   # the user returns to a tab that has been inactive long enough that the server was killed off in
@@ -326,6 +281,63 @@ interface UiView extends(PowerboxCapability) {
   # `sessionParams` is a struct whose type is specified by the session type.  By convention, this
   # struct should be defined nested in the session interface type with name "Params", e.g.
   # `WebSession.Params`.  This struct contains some arbitrary startup information.
+  #
+  # `tabId` is a stable identifier for the "tab" (as in, Sandstorm sidebar tab) in which the grain
+  # is being displayed. A single tab may span multiple UiSessions, for instance if the user
+  # suspends their laptop and then restores later, or if the grain crashes. More importantly,
+  # `tabId` allows multiple grains being composed in the same tab to coordinate. For example, when
+  # a grain is embedded in the powerbox UI to respond to a request, it sees the same `tabId` as
+  # the requesting grain. Similarly, when a grain embeds other grains within iframes within its
+  # own UI, they will all see the same `tabId`. One particular case where `tabId` is useful is
+  # in implementing an `EmailVerifier` that cannot be MITM'd. NOTE: `tabId` should NOT be presumed
+  # to be a secret, although no two tabs in all of time will have the same `tabId`.
+  #
+  # For API requests, `tabId` uniquely identifies the token, as so can be used to correlate
+  # multiple requests from the same client.
+
+  newRequestSession @2 (userInfo :Identity.UserInfo, context :SessionContext,
+                        sessionType :UInt64, sessionParams :AnyPointer,
+                        requestInfo :List(Powerbox.PowerboxDescriptor), tabId :Data)
+                    -> (session :UiSession);
+  # Creates a new session based on a powerbox request. `requestInfo` is the subset of the original
+  # request description which matched descriptors that this grain indicated it provides via
+  # `ViewInfo.matchRequests`. The list is also sorted with the "best match" first, such that
+  # it is reasonable for a grain to ignore all descriptors other than the first.
+  #
+  # Keep in mind that, as with any other session, the UiSession capability could become
+  # disconnected randomly and the front-end will then reconnect by calling `newRequestSession()`
+  # again with the same parameters. Generally, apps should avoid storing any session-related state
+  # on the server side; it's easy to use client-side sessionStorage instead.
+  #
+  # The `tabId` passed here identifies the requesting tab; see docs under `newSession()`.
+
+  newOfferSession @3 (userInfo :Identity.UserInfo, context :SessionContext,
+                      sessionType :UInt64, sessionParams :AnyPointer,
+                      offer :Capability, descriptor :Powerbox.PowerboxDescriptor,
+                      tabId :Data)
+                  -> (session :UiSession);
+  # Creates a new session based on a powerbox offer. `offer` is the capability being offered and
+  # `descriptor` describes it.
+  #
+  # By default, an "offer" session is displayed embedded in the powerbox much like a "request"
+  # session is. If the the session implements a quick action -- say "share to friend by email" --
+  # then it may make sense for it to remain embedded, returning the user to the offering app when
+  # done. The app may call `SessionContext.close()` to indicate that it's time to close. However,
+  # in some cases it makes a lot of sense for the app to become "full-frame", for example a
+  # document editor app accepting a document offer may want to then open the editor for long-term
+  # use. Such apps should call `SessionContext.openView()` to move on to a full-fledged session.
+  # Finally, some apps will take an offer, wrap it in some filter, and then make a new offer of the
+  # wrapped capability. To that end, calling `SessionContext.offer()` will end the offer session
+  # but immediately start a new offer interaction in its place using the new capability.
+  #
+  # Keep in mind that, as with any other session, the UiSession capability could become
+  # disconnected randomly and the front-end will then reconnect by calling `newOfferSession()`
+  # again with the same parameters. Generally, apps should avoid storing any session-related state
+  # on the server side; it's easy to use client-side sessionStorage instead. (Of course, if the
+  # session calls `SessionContext.openView()`, the new view will be opened as a regular session,
+  # not an offer session.)
+  #
+  # The `tabId` passed here identifies the offering tab; see docs under `newSession()`.
 }
 
 # ========================================================================================
@@ -335,70 +347,20 @@ interface UiSession {
   # Base interface for UI sessions.  The most common subclass is `WebSession`.
 }
 
-struct UserInfo {
-  # Information about the user opening a new session.
-  #
-  # TODO(soon):  More details:
-  # - Profile:  Name, avatar, profile link
-  # - Sharing/authority chain:  "Carol (via Bob, via Alice)"
-  # - Identity:  Public key, certificates, verification of proxy chain.
-
-  displayName @0 :Util.LocalizedText;
-  # Name by which to identify this user within the user interface.  For example, if two users are
-  # editing a document simultaneously, the application may display each user's cursor position to
-  # the other, labeled with the respective display names.  As the users edit the document, the
-  # document's history may be annotated with the display name of the user who made each change.
-  # Display names are NOT unique nor stable:  two users could potentially have the same display
-  # name and a user's display name could change.
-
-  deprecatedPermissionsBlob @1 :Data;
-  permissions @3 :PermissionSet;
-  # Set of permissions which this user has.  The exact set might not correspond directly to any
-  # particular role for a number of reasons:
-  # - The sharer may have toggled individual permissions through the advanced settings.
-  # - If two different users share different roles to a third user, and neither of the roles is a
-  #   strict superset of the other, the user gets the union of the two permissions.
-  # - If Alice shares role A to Bob, and Bob further delegates role B to Carol, then Carol's
-  #   permissions are the intersection of those granted by roles A and B.
-  #
-  # That said, some combinations of permissions may not make sense.  For example, a document editor
-  # probably has no reasonable way to implement write permission without read permission.  It is up
-  # to the application to decide what to do in this case, but simply ignoring the nonsensical
-  # permissions is often a fine strategy.
-  #
-  # If the user's permissions are reduced while the session is opened, the session will be closed
-  # by the platform and the user forced to start a new one.  If the user's permissions are increased
-  # while the session is opened, the system will prompt them to start a new session to use the new
-  # permissions.  Either way, the application need not worry about permissions changing during a
-  # session.
-
-  userId @2 :Data;
-  # A unique, stable identifier for the calling user. This is computed such that a user's ID will
-  # be the same across all Sandstorm servers, and will not collide with any other user ID in the
-  # world. Therefore, grains transferred between servers can still count on the user IDs being the
-  # same and secure (unless the new host is itself malicious, of course, in which case all bets are
-  # off).
-  #
-  # The ID is actually a SHA-256 hash, therefore it is always exactly 32 bytes and the app can
-  # safely truncate it down to some shorter prefix according to its own security/storage trade-off
-  # needs.
-  #
-  # If the user is not logged in, `userId` is null.
-}
-
 interface SessionContext {
   # Interface that the application can use to call back to the platform in the context of a
   # particular session.  This can be used e.g. to ask the platform to present certain system
   # dialogs to the user.
 
-  getSharedPermissions @0 () -> (var :Util.Assignable(PermissionSet).Getter);
+  getSharedPermissions @0 () -> (var :Util.Assignable(Identity.PermissionSet).Getter);
   # Returns an observer on the permissions held by the user of this session.
   # This observer can be persisted beyond the end of the session.  This is useful for detecting if
   # the user later loses their access and auto-revoking things in that case.  See also `tieToUser()`
   # for an easier way to make a particular capability auto-revoke if the user's permissions change.
 
-  tieToUser @1 (cap :PowerboxCapability, requiredPermissions :PermissionSet)
-            -> (tiedCap :PowerboxCapability);
+  tieToUser @1 (cap :Capability, requiredPermissions :Identity.PermissionSet,
+                displayInfo :Powerbox.PowerboxDisplayInfo)
+            -> (tiedCap :Capability);
   # Create a version of `cap` which will automatically stop working if the user no longer holds the
   # permissions indicated by `requiredPermissions` (and starts working again if the user regains
   # those permissions).  The capability also appears connected to the user in the sharing
@@ -410,20 +372,142 @@ interface SessionContext {
   # _without_ actually passing that capability to the user, use `getSharedPermissions()` to detect
   # when the user's permissions change and implement it yourself.
 
-  offer @2 (cap :PowerboxCapability, requiredPermissions :PermissionSet) -> ();
+  offer @2 (cap :Capability, requiredPermissions :Identity.PermissionSet,
+            descriptor :Powerbox.PowerboxDescriptor, displayInfo :Powerbox.PowerboxDisplayInfo);
   # Offer a capability to the user.  A dialog box will ask the user what they want to do with it.
-  # Depending on the type of capability, different options may be provided.  All capabilities will
-  # offer the user the option to save the capability to their capability/grain store.  Other
-  # type-specific actions may be offered by the platform or by other applications.
+  # Depending on the type of capability (as indicated by `descriptor`), different options may be
+  # provided.  All capabilities will offer the user the option to save the capability to their
+  # capability/grain store.  Other type-specific actions may be offered by the platform or by other
+  # applications.
   #
   # For example, offering a UiView will give the user options like "open in new tab", "save to
   # grain list", and "share with another user".
   #
   # The capability is implicitly tied to the user as if via `tieToUser()`.
 
-  request @3 (query :PowerboxQuery) -> (cap :PowerboxCapability);
-  # Searches for capabilities in the user's powerbox matching the given query and displays a
-  # selection UI to the user.  Returns the selected capability.
+  request @3 (query :List(Powerbox.PowerboxDescriptor), requiredPermissions :Identity.PermissionSet)
+          -> (cap :Capability, descriptor :Powerbox.PowerboxDescriptor);
+  # Although this method exists, it is unimplemented and currently you are meant to use the
+  # postMessage api to get a temporary token and then restore it with claimRequest().
+  #
+  # The postMessage api is an rpc interface so you will have to listen for a `message` callback
+  # after sending a postMessage. The postMessage object should have the following form:
+  #
+  # powerboxRequest:
+  #   rpcId: A unique string that should identify this rpc message to the app. You will receive this
+  #          id in the callback to verify which message it is referring to.
+  #   query: A list of PowerboxDescriptor objects, serialized as a Javascript array of
+  #          base64-encoded packed powerbox query descriptors created using the `spk query` tool.
+  #   saveLabel: A petname to give this label. This will be displayed to the user as the name
+  #          for this capability.
+  #
+  # e.g.:
+  #   window.parent.postMessage({
+  #     powerboxRequest: {
+  #       rpcId: myRpcId,
+  #       query: [
+  #         // encoded/packed/base64url of (tags = [(id = 15831515641881813735)])
+  #         "EAZQAQEAABEBF1EEAQH_5-Jn6pjXtNsAAAA",
+  #       ],
+  #       saveLabel: { defaultText: "Linked grain" },
+  #     },
+  #   }, "*");
+  #
+  # The postMessage searches for capabilities in the user's powerbox matching the given query and
+  # displays a selection UI to the user.
+  # This will then initiate a powerbox interaction with the user, and when it is done, a postMessage
+  # callback to the grain will occur. You can listen for such a message like so:
+  # window.addEventListener("message", function (event) {
+  #   if (event.data.rpcId === myRpcId && !event.data.error) {
+  #     // Pass `event.data.token` to your app's server and call SessionContext.claimRequest() with
+  #     // it. The token is guaranteed to be a URL-safe string. That is, passing it through
+  #     // encodeURIComponent() should be a no-op.
+  #   }
+  # }, false)
+
+  claimRequest @7 (requestToken :Text, requiredPermissions :Identity.PermissionSet)
+               -> (cap :Capability);
+  # When a powerbox request is initiated client-side via the postMessage API and the user completes
+  # the request flow, the Sandstorm shell responds to the requesting app with a token. This token
+  # itself is not a SturdyRef, but can be exchanged server-side for a capability which in turn
+  # can be save()d to produce a SturdyRef. `claimRequest()` is the method to call to exchange the
+  # token for a capability. It must be called within a short period after the powerbox request
+  # completes; we recommend that the app immediately send the token up to its server to claim
+  # the capability.
+  #
+  # If you are familiar with OAuth, the `requestToken` can be compared to an OAuth "authorization
+  # code", whereas a SturdyRef is like an "access token". The authorization code must be exchanged
+  # for an access token in a server-to-server interaction.
+  #
+  # You might consider an alternative approach in which the client-side response includes a
+  # newly-minted SturdyRef directly, avoiding the need for a server-side exchange. The problem with
+  # that approach is that it makes SturdyRef leaks more dangerous. If an application leaks one of
+  # its SturdyRefs to an attacker, the attacker may then initiate a powerbox request on the client
+  # side in which the attacker spoofs the response from the Sandstorm shell to inject the leaked
+  # SturdyRef. The app likely will not realize that this SturdyRef was not newly-minted and may
+  # then use it in a context where it was not intended. Adding the claimRequest() requirement makes
+  # a leaked SturdyRef less likely to be useful to an attacker since the attacker cannot usefully
+  # inject the SturdyRef into a subsequent spoofed powerbox response, since a SturdyRef is not
+  # usable as a `requestToken`.
+  #
+  # `requiredPermissions` specifies permissions which must be held on *this* grain by the user
+  # who completed the powerbox interaction. (The implicit "can access the grain at all" permission
+  # is always treated as a required permission, even if `requiredPermissions` is null or empty.)
+  # This way, if a user of a grain connects the grain to other resources, but later has their access
+  # to the grain revoked, these connections are revoked as well.
+  #
+  # Consider this example: Alice owns a grain which implements a discussion forum. At some point,
+  # Alice invites Dave to participate in the forum, and she gives him moderator permissions. As
+  # part of being a moderator, Dave arranges to have a notification emailed to him whenever a post
+  # is flagged for moderation. To set this up, the forum app makes a powerbox request for an email
+  # send capability directed to his email address. Later on, Alice decides to demote Dave from
+  # "moderator" status to "participant". At this point, Dave should stop receiving email
+  # notifications; the capability he introduced in the powerbox request should be revoked. Alice
+  # actually has no idea that Dave set up to receive these notifications, so she does not know
+  # to revoke it manually; we want it to happen automatically, or at least we want to be able to
+  # call Alice's attention to it.
+  #
+  # To this end, after the Powerbox request is made through Dave and he chooses a capability, the
+  # app will call `claimRequest()` and indicate in `requiredPermissions` that Dave must have
+  # "moderator" permission. The app then `save()`s the capability. In the future, if Dave has lost
+  # this permission, then attempts to `restore()` the SturdyRef will fail.
+
+  fulfillRequest @4 (cap :Capability, requiredPermissions :Identity.PermissionSet,
+              descriptor :Powerbox.PowerboxDescriptor, displayInfo :Powerbox.PowerboxDisplayInfo);
+  # For sessions started with `newRequestSession()`, fulfills the original request. If only one
+  # capability was requested, the powerbox will close upon `fulfillRequest()` being called. If
+  # multiple capabilities were requested, then the powerbox remains open and `fulfillRequest()` may
+  # be called repeatedly.
+  #
+  # If the session was not started with `newRequestSession()`, this method is equivalent to
+  # `offer()`. This can be helpful when building a UI that can be used both embedded in the
+  # powerbox and stand-alone.
+
+  close @5 ();
+  # Closes the session.
+  # - For regular sessions, the user will be returned to the home screen.
+  # - For powerbox "request" sessions, the user will be returned to the main grain selection list.
+  # - For powerbox "offer" sessions, the powerbox will be closed and the user will return to the
+  #   offering app.
+  #
+  # Note that in some cases it is possible for the user to return by clicking "back", so the app
+  # should not assume that no further requests will happen.
+
+  openView @6 (view :UiView, path :Text = "", newTab :Bool = false);
+  # Navigates the user to some other UiView (from the same grain or another), closing the current
+  # session. If `view` is null, navigates back to the the current view, in a new session.
+  #
+  # `path` is an optional path to jump directly to within the new session. For WebSessions, this
+  # is appended to the URL, and may include query (search) and fragment (hash) components, but
+  # should never start with '/'. Example: "foo/bar?baz=qux#corge"
+  #
+  # If `newTab` is true, the new session is opened in a new tab.
+  #
+  # If the current session is a powerbox session, `openView()` affects the top-level tab, thereby
+  # closing the powerbox and the app that initiated the powerbox (unless `newTab` is true).
+
+  activity @8 (event :Activity.ActivityEvent);
+  # Call each time the user performs some activity that should be logged.
 }
 
 # ========================================================================================
@@ -452,11 +536,8 @@ struct PermissionDef {
   # longer be offered to the user in future sharing actions.
 }
 
-using PermissionSet = List(Bool);
-# Set of permission IDs, represented as a bitfield.
-
 struct RoleDef {
-  # Metadata describing a sharable role.
+  # Metadata describing a shareable role.
 
   title @0 :Util.LocalizedText;
   # Name of the role, e.g. "editor" or "viewer".
@@ -469,7 +550,7 @@ struct RoleDef {
   description @2 :Util.LocalizedText;
   # Prose describing what this role means, suitable for a tool tip or similar help text.
 
-  permissions @3 :PermissionSet;
+  permissions @3 :Identity.PermissionSet;
   # Permissions which make up this role.  For example, the "editor" role on a document would
   # typically include "read" and "write" permissions.
 
@@ -477,6 +558,15 @@ struct RoleDef {
   # If true, this role was relevant in a previous version of the application but should no longer
   # be offered to the user in future sharing actions.  The role may still be displayed if it was
   # used to share the view while still running the old version.
+
+  default @5 :Bool = false;
+  # If true, this role should be used for any sharing actions that took place using a previous
+  # version of the app that did not define any roles. This allows you to seamlessly add roles to
+  # an already-deployed app without breaking existing shares. If you do not mark any roles as
+  # "default", then such sharing actions will be treated as having an empty permissions set (the
+  # user can open the grain, but the grain is told that the user has no permissions).
+  #
+  # See also `ViewSharingLink.RoleAssignment.none`, below.
 }
 
 interface SharingLink {
@@ -494,55 +584,21 @@ interface ViewSharingLink extends(SharingLink) {
 
   struct RoleAssignment {
     union {
-      allAccess @0 :Void;  # Grant all permissions.
-      roleId @1 :UInt16;   # Grant permissions for the given role.
+      none      @0: Void;
+      # No role was explicitly chosen. The main case where this happens is when an app defining
+      # no roles is shared. Note that "none" means "no role", but does NOT necessarily mean
+      # "no permissions". If a default role is defined (see `RoleDef.default`), that will be used.
+
+      allAccess @1 :Void;  # Grant all permissions.
+      roleId @2 :UInt16;   # Grant permissions for the given role.
     }
 
-    addPermissions @2 :PermissionSet;
+    addPermissions @3 :Identity.PermissionSet;
     # Permissions to add on top of those granted above.
 
-    removePermissions @3 :PermissionSet;
+    removePermissions @4 :Identity.PermissionSet;
     # Permissions to remove from those granted above.
   }
-}
-
-# ========================================================================================
-# Notifications
-#
-# TODO(someday): Flesh out the notifications API. Currently this is only used for
-#   `SandstormApi.stayAwake()`.
-
-struct NotificationDisplayInfo {
-  caption @0 :Util.LocalizedText;
-  # Text to display inside the notification box.
-
-  # TODO(someday): Support interactive notifications.
-}
-
-interface NotificationTarget {
-  # Represents a destination for notifications; usually, a user.
-  #
-  # TODO(someday): Expand on this and move it into `grain.capnp` when notifications are
-  #   fully-implemented.
-
-  addOngoing @0 (displayInfo :NotificationDisplayInfo, notification :OngoingNotification)
-             -> (handle :Util.Handle);
-  # Sends an ongoing notification to the notification target. `notification` must be persistent.
-  # The notification is removed when the returned `handle` is dropped. The handle is persistent.
-}
-
-interface OngoingNotification {
-  # Callback interface passed to the platform when registering a persistent notification.
-
-  cancel @0 ();
-  # Informs the notification creator that the user has requested cancellation of the task
-  # underlying this notification.
-  #
-  # In the case of a `SandstormApi.stayAwake()` notification, after `cancel()` is called, the app
-  # will no longer be held awake, so should prepare for shutdown.
-  #
-  # TODO(someday): We could allow the app to return some text to display to the user asking if
-  #   they really want to shut down.
 }
 
 # ========================================================================================
@@ -557,7 +613,7 @@ struct GrainInfo {
 # ========================================================================================
 # Persistent objects
 
-interface AppPersistent(AppObjectId) {
+interface AppPersistent @0xaffa789add8747b8 (AppObjectId) {
   # To make an object implemented by your own app persistent, implement this interface.
   #
   # `AppObjectId` is a structure like a URL which identifies a specific object within your app.

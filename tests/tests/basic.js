@@ -17,34 +17,31 @@
 'use strict';
 
 var utils = require('../utils'),
-    short_wait = utils.short_wait;
+    short_wait = utils.short_wait,
+    disable_demo = utils.disable_demo;
 
 module.exports = {
   "Test title" : function (browser) {
     browser
       .init()
-      .assert.title('Sandstorm');
+      .assert.title('Sandstorm')
+      .end();
   },
 
-  "Test github login command" : function (browser) {
+  "Test login command" : function (browser) {
     browser
-      .loginGithub()
-      .waitForElementVisible('#login-name-link', short_wait)
-      .assert.containsText("#login-name-link", "Github User");
+      .loginDevAccount("TestingLogin")
+      .waitForElementVisible('.topbar .account>.show-popup', short_wait)
+      .assert.containsText(".topbar .account>.show-popup", "TestingLogin")
+      .end();
   },
-
-  "Test google login command" : function (browser) {
-    browser
-      .loginGoogle()
-      .waitForElementVisible('#login-name-link', short_wait)
-      .assert.containsText("#login-name-link", "Google User");
-  },
-
-  "Test demo login command" : function (browser) {
+};
+if (!disable_demo) {
+  module.exports["Test demo login command"] = function (browser) {
     browser
       .loginDemo()
-      .waitForElementVisible('#login-name-link', short_wait)
-      .assert.containsText("#login-name-link", "Demo User")
+      .waitForElementVisible('.topbar .account>.show-popup', short_wait)
+      .assert.containsText(".topbar .account>.show-popup", "Demo")
       .end();
-  }
-};
+  };
+}

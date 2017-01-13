@@ -22,7 +22,11 @@
 #include <capnp/schema.h>
 #include <capnp/dynamic.h>
 #include <capnp/serialize.h>
+#include <capnp/compat/json.h>
 #include <sandstorm/package.capnp.h>
+#include <sandstorm/update-tool.capnp.h>
+#include <sodium/randombytes.h>
+#include <sodium/crypto_sign_ed25519.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <limits.h>
@@ -37,6 +41,8 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/capability.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <linux/securebits.h>
 #include <sched.h>
 #include <grp.h>
@@ -49,13 +55,15 @@
 #include <sys/un.h>
 #include <netdb.h>
 #include <dirent.h>
+#include <arpa/inet.h>
 
 #include "version.h"
 #include "send-fd.h"
 #include "supervisor.h"
 #include "util.h"
 #include "spk.h"
-#include "minibox.h"
+#include "backend.h"
+#include "backup.h"
 
 namespace sandstorm {
 
@@ -90,6 +98,48 @@ kj::AutoCloseFd prepareMonitoringLoop() {
   return kj::AutoCloseFd(sigfd);
 }
 
+static bool symlinkPointsInto(kj::StringPtr symlink, kj::StringPtr targetPrefix) {
+  // Returns true if the given path names a symlink whose target has the given prefix, false if
+  // it points elsewhere or doesn't exist or isn't a symlink.
+retry:
+  char buffer[PATH_MAX];
+  ssize_t n = readlink(symlink.cStr(), buffer, sizeof(buffer) - 1);
+  if (n < 0) {
+    int error = errno;
+    switch (error) {
+      case ENOENT:
+      case ENOTDIR:
+      case EINVAL:
+        // File (or parent directory) dosen't exist or isn't a symlink.
+        return false;
+      case EINTR:
+        goto retry;
+      default:
+        KJ_FAIL_SYSCALL("readlink(symlink)", error, symlink);
+    }
+  } else {
+    buffer[n] = '\0';
+    return kj::StringPtr(buffer, n).startsWith(targetPrefix);
+  }
+}
+
+static bool fileHasLine(kj::StringPtr filename, kj::StringPtr expectedLine) {
+  // Returns true if the given text file contains a line matching exactly the given string.
+  auto file = raiiOpenIfExists(filename, O_RDONLY | O_CLOEXEC);
+  KJ_IF_MAYBE(f, file) {
+    for (auto& line: splitLines(readAll(*f))) {
+      if (line == expectedLine) {
+        return true;
+      }
+    }
+    // File doesn't contain line.
+    return false;
+  } else {
+    // File doesn't exist at all.
+    return false;
+  }
+}
+
 // =======================================================================================
 
 struct KernelVersion {
@@ -122,19 +172,43 @@ KernelVersion getKernelVersion() {
 
 bool isKernelNewEnough() {
   auto version = getKernelVersion();
-  if (version.major < 3 || (version.major == 3 && version.minor < 13)) {
+  if (version.major < 3 || (version.major == 3 && version.minor < 10)) {
     // Insufficient kernel version.
     return false;
   }
 
-  // unprivileged_userns_clone, for systems that have it, must be enabled (set to 1).
-  if (access("/proc/sys/kernel/unprivileged_userns_clone", F_OK) == 0 &&
-      !KJ_ASSERT_NONNULL(parseUInt(trim(
-          readAll("/proc/sys/kernel/unprivileged_userns_clone")), 10))) {
-    return false;
-  }
-
   return true;
+}
+
+bool isUserNsAvailable() {
+  Subprocess child([]() {
+    if (getuid() == 0) {
+      if (setuid(1000) < 0) {
+        // setuid() failed?
+        return 2;
+      }
+    }
+
+    if (unshare(CLONE_NEWUSER) < 0) {
+      return 1;
+    }
+
+    return 0;
+  });
+
+  int status = child.waitForExit();
+  switch (status) {
+    case 0:
+      return true;
+    case 1:
+      return false;
+    case 2:
+      KJ_LOG(ERROR, "setuid() failed when trying to test if unprivileged userns works");
+      return true;
+    default:
+      KJ_LOG(ERROR, "userns test process exited with unexpected status code", status);
+      return true;
+  }
 }
 
 // =======================================================================================
@@ -199,6 +273,33 @@ struct UserIds {
   gid_t gid = 0;
   kj::Array<gid_t> groups;
 };
+
+kj::Array<uint> parsePorts(kj::Maybe<uint> httpsPort, kj::StringPtr portList) {
+  auto portsSplitOnComma = split(portList, ',');
+  size_t numHttpPorts = portsSplitOnComma.size();
+  size_t numHttpsPorts;
+  kj::Array<uint> result;
+
+  // If the configuration has a https port, then add it first.
+  KJ_IF_MAYBE(portNumber, httpsPort) {
+    numHttpsPorts = 1;
+    result = kj::heapArray<uint>(numHttpsPorts + numHttpPorts);
+    result[0] = *portNumber;
+  } else {
+    numHttpsPorts = 0;
+    result = kj::heapArray<uint>(numHttpsPorts + numHttpPorts);
+  }
+
+  for (size_t i = 0; i < portsSplitOnComma.size(); i++) {
+    KJ_IF_MAYBE(portNumber, parseUInt(trim(portsSplitOnComma[i]), 10)) {
+      result[i + numHttpsPorts] = *portNumber;
+    } else {
+      KJ_FAIL_REQUIRE("invalid config value PORT", portList);
+    }
+  }
+
+  return kj::mv(result);
+}
 
 kj::Maybe<UserIds> getUserIds(kj::StringPtr name) {
   // We can't use getpwnam() in a statically-linked binary, so we shell out to id(1).  lol.
@@ -285,7 +386,17 @@ public:
     }
   }
 
-  ~CurlRequest() {
+  explicit CurlRequest(kj::StringPtr url, int outFd): url(kj::heapString(url)) {
+    KJ_SYSCALL(pid = fork());
+    if (pid == 0) {
+      KJ_SYSCALL(dup2(outFd, STDOUT_FILENO));
+      KJ_SYSCALL(execlp("curl", "curl", isatty(STDERR_FILENO) ? "-f" : "-fs",
+                        url.cStr(), EXEC_END_ARGS), url);
+      KJ_UNREACHABLE;
+    }
+  }
+
+  ~CurlRequest() noexcept(false) {
     if (pid == 0) return;
 
     // Close the pipe first, in case the child is waiting for that.
@@ -317,172 +428,6 @@ private:
 };
 
 // =======================================================================================
-// JSON-ify Cap'n Proto message
-//
-// Used specifically to insert a dev app's manifest into the database.
-//
-// TODO(cleanup): This REALLY belongs somewhere else!
-
-static const char HEXDIGITS[] = "0123456789abcdef";
-
-static capnp::schema::Type::Which whichFieldType(const capnp::StructSchema::Field& field) {
-  auto proto = field.getProto();
-  switch (proto.which()) {
-    case capnp::schema::Field::SLOT:
-      return proto.getSlot().getType().which();
-    case capnp::schema::Field::GROUP:
-      return capnp::schema::Type::STRUCT;
-  }
-  KJ_UNREACHABLE;
-}
-
-static kj::StringTree toJson(const capnp::DynamicValue::Reader& value,
-                             capnp::schema::Type::Which which) {
-  switch (value.getType()) {
-    case capnp::DynamicValue::UNKNOWN:
-      return kj::strTree("null");
-    case capnp::DynamicValue::VOID:
-      return kj::strTree("null");
-    case capnp::DynamicValue::BOOL:
-      return kj::strTree(value.as<bool>() ? "true" : "false");
-    case capnp::DynamicValue::INT:
-      if (which == capnp::schema::Type::INT64 ||
-          which == capnp::schema::Type::UINT64) {
-        // 64-bit values must be stringified to avoid losing precision.
-        return kj::strTree('\"', value.as<int64_t>(), '\"');
-      } else {
-        return kj::strTree(value.as<int32_t>());
-      }
-    case capnp::DynamicValue::UINT:
-      if (which == capnp::schema::Type::INT64 ||
-          which == capnp::schema::Type::UINT64) {
-        // 64-bit values must be stringified to avoid losing precision.
-        return kj::strTree('\"', value.as<uint64_t>(), '\"');
-      } else {
-        return kj::strTree(value.as<uint64_t>());
-      }
-    case capnp::DynamicValue::FLOAT:
-      if (which == capnp::schema::Type::FLOAT32) {
-        return kj::strTree(value.as<float>());
-      } else {
-        return kj::strTree(value.as<double>());
-      }
-    case capnp::DynamicValue::TEXT: {
-      auto chars = value.as<capnp::Text>();
-      kj::Vector<char> escaped(chars.size());
-
-      for (char c: chars) {
-        switch (c) {
-          case '\a': escaped.addAll(kj::StringPtr("\\a")); break;
-          case '\b': escaped.addAll(kj::StringPtr("\\b")); break;
-          case '\f': escaped.addAll(kj::StringPtr("\\f")); break;
-          case '\n': escaped.addAll(kj::StringPtr("\\n")); break;
-          case '\r': escaped.addAll(kj::StringPtr("\\r")); break;
-          case '\t': escaped.addAll(kj::StringPtr("\\t")); break;
-          case '\v': escaped.addAll(kj::StringPtr("\\v")); break;
-          case '\'': escaped.addAll(kj::StringPtr("\\\'")); break;
-          case '\"': escaped.addAll(kj::StringPtr("\\\"")); break;
-          case '\\': escaped.addAll(kj::StringPtr("\\\\")); break;
-          default:
-            if (c < 0x20) {
-              escaped.add('\\');
-              escaped.add('x');
-              uint8_t c2 = c;
-              escaped.add(HEXDIGITS[c2 / 16]);
-              escaped.add(HEXDIGITS[c2 % 16]);
-            } else {
-              escaped.add(c);
-            }
-            break;
-        }
-      }
-      return kj::strTree('"', escaped, '"');
-    }
-    case capnp::DynamicValue::DATA:
-      // TODO(someday): This is a crappy encoding for bytes. It produces the semantic value we want,
-      //   but we really want to supply it as base64 and have it deserialize into a Buffer.
-      return kj::strTree('[',
-        kj::StringTree(KJ_MAP(b, value.as<capnp::Data>()) { return kj::strTree((uint)b); }, ","),
-        ']');
-
-    case capnp::DynamicValue::LIST: {
-      auto listValue = value.as<capnp::DynamicList>();
-      auto which = listValue.getSchema().whichElementType();
-      kj::Array<kj::StringTree> elements = KJ_MAP(element, listValue) {
-        return toJson(element, which);
-      };
-      return kj::strTree('[', kj::StringTree(kj::mv(elements), ","), ']');
-    }
-    case capnp::DynamicValue::ENUM: {
-      auto enumValue = value.as<capnp::DynamicEnum>();
-      KJ_IF_MAYBE(enumerant, enumValue.getEnumerant()) {
-        return kj::strTree('\"', enumerant->getProto().getName(), '\"');
-      } else {
-        // Unknown enum value; output raw number.
-        return kj::strTree(enumValue.getRaw());
-      }
-      break;
-    }
-    case capnp::DynamicValue::STRUCT: {
-      auto structValue = value.as<capnp::DynamicStruct>();
-      auto unionFields = structValue.getSchema().getUnionFields();
-      auto nonUnionFields = structValue.getSchema().getNonUnionFields();
-
-      kj::Vector<kj::StringTree> printedFields(nonUnionFields.size() + (unionFields.size() != 0));
-
-      // We try to write the union field, if any, in proper order with the rest.
-      auto which = structValue.which();
-
-      kj::StringTree unionValue;
-      KJ_IF_MAYBE(field, which) {
-        // Even if the union field has its default value, if it is not the default field of the
-        // union then we have to print it anyway.
-        auto fieldProto = field->getProto();
-        if (fieldProto.getDiscriminantValue() != 0 || structValue.has(*field)) {
-          unionValue = kj::strTree(
-              '\"', fieldProto.getName(), "\":",
-              toJson(structValue.get(*field), whichFieldType(*field)));
-        } else {
-          which = nullptr;
-        }
-      }
-
-      for (auto field: nonUnionFields) {
-        KJ_IF_MAYBE(unionField, which) {
-          if (unionField->getIndex() < field.getIndex()) {
-            printedFields.add(kj::mv(unionValue));
-            which = nullptr;
-          }
-        }
-        if (structValue.has(field)) {
-          printedFields.add(kj::strTree(
-              '\"', field.getProto().getName(), "\":",
-              toJson(structValue.get(field), whichFieldType(field))));
-        }
-      }
-      if (which != nullptr) {
-        // Union value is last.
-        printedFields.add(kj::mv(unionValue));
-      }
-
-      return kj::strTree('{', kj::StringTree(printedFields.releaseAsArray(), ","), '}');
-    }
-    case capnp::DynamicValue::CAPABILITY:
-      // TODO(someday): Implement capabilities?
-      return kj::strTree("null");
-    case capnp::DynamicValue::ANY_POINTER:
-      // TODO(someday): Convert to bytes?
-      return kj::strTree("null");
-  }
-
-  KJ_UNREACHABLE;
-}
-
-kj::StringTree toJson(capnp::DynamicStruct::Reader value) {
-  return toJson(value, capnp::schema::Type::STRUCT);
-}
-
-// =======================================================================================
 
 class RunBundleMain {
   // Main class for the Sandstorm bundle runner.  This is a convenience tool for running the
@@ -497,13 +442,9 @@ public:
     clearSignalMask();
     umask(0022);
 
-    if (!kernelNewEnough) {
-      context.warning(
-          "WARNING: Your Linux kernel is too old or unprivileged user namespaces are disabled. "
-          "You need at least kernel version 3.13 and must set the "
-          "kernel.unprivileged_userns_clone sysctl (if your system has it) to 1. The next "
-          "version of Sandstorm will require these things, so updates will be disabled for now. "
-          "If in doubt, re-run the Sandstorm installer for help.");
+    if (!isKernelNewEnough()) {
+      context.exitError(
+          "ERROR: Your Linux kernel is too old. You need at least kernel version 3.10.");
     }
   }
 
@@ -518,8 +459,8 @@ public:
       } else if (programName == "spk" || programName.endsWith("/spk")) {
         alternateMain = getSpkMain(context);
         return alternateMain->getMain();
-      } else if (programName == "minibox" || programName.endsWith("/minibox")) {
-        alternateMain = getMiniboxMain(context);
+      } else if (programName == "backup" || programName.endsWith("/backup")) {
+        alternateMain = kj::heap<BackupMain>(context);
         return alternateMain->getMain();
       }
     }
@@ -529,14 +470,14 @@ public:
             "Something not working? Check the logs in SANDSTORM_HOME/var/log.")
         .addSubCommand("start",
             [this]() {
-              return kj::MainBuilder(context, VERSION, "Start the Sandstorm server (default).")
+              return kj::MainBuilder(context, VERSION, "Starts the Sandstorm server (default).")
                   .callAfterParsing(KJ_BIND_METHOD(*this, start))
                   .build();
             },
             "Start the sandstorm server.")
         .addSubCommand("stop",
             [this]() {
-              return kj::MainBuilder(context, VERSION, "Stop the Sandstorm server.")
+              return kj::MainBuilder(context, VERSION, "Stops the Sandstorm server.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, stop))
                   .build();
             },
@@ -544,7 +485,7 @@ public:
         .addSubCommand("start-fe",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                    "Start the Sandstorm front-end after it has previously been stopped using "
+                    "Starts the Sandstorm front-end after it has previously been stopped using "
                     "the `stop-fe` command.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, startFe))
                   .build();
@@ -553,7 +494,7 @@ public:
         .addSubCommand("stop-fe",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                    "Stop the Sandstorm front-end, but leave Mongo running. Useful when you "
+                    "Stops the Sandstorm front-end, but leaves Mongo running. Useful when you "
                     "want to run the front-end in dev mode in front of the existing database "
                     "and grains.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, stopFe))
@@ -563,15 +504,15 @@ public:
         .addSubCommand("status",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                      "Check if Sandstorm is running. Prints the pid and exits successfully if so; "
-                      "exits with an error otherwise.")
+                      "Checks whether Sandstorm is running. Prints the pid and exits successfully "
+                      "if so; exits with an error otherwise.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, status))
                   .build();
             },
             "Check if Sandstorm is running.")
         .addSubCommand("restart",
             [this]() {
-              return kj::MainBuilder(context, VERSION, "Restart Sandstorm server.")
+              return kj::MainBuilder(context, VERSION, "Restarts Sandstorm server.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, restart))
                   .build();
             },
@@ -579,7 +520,7 @@ public:
         .addSubCommand("mongo",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                  "Run MongoDB shell, connecting to the an already-running Sandstorm server.")
+                  "Runs MongoDB shell, connecting to the already-running Sandstorm server.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, mongo))
                   .build();
             },
@@ -587,7 +528,7 @@ public:
         .addSubCommand("update",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                      "Update the Sandstorm platform to a new version. If <release> is provided "
+                      "Updates the Sandstorm platform to a new version. If <release> is provided "
                       "and specifies a bundle file (something like sandstorm-1234.tar.xz) it is "
                       "used as the update. If <release> is a channel name, e.g. \"dev\", we "
                       "securely check the web for an update. If <release> is not provided, we "
@@ -603,64 +544,51 @@ public:
               return alternateMain->getMain();
             },
             "Manipulate spk files.")
-        .addSubCommand("minibox",
-            [this]() {
-              alternateMain = getMiniboxMain(context);
-              return alternateMain->getMain();
-            },
-            "Command-line sandboxing tool.")
-        .addSubCommand("devtools",
-            [this]() {
-              return kj::MainBuilder(context, VERSION,
-                      "Place symlinks in <bindir> (default: /usr/local/bin) to the dev tools "
-                      "in this package.")
-                  .expectOptionalArg("<bindir>", KJ_BIND_METHOD(*this, setDevtoolsBindir))
-                  .callAfterParsing(KJ_BIND_METHOD(*this, devtools))
-                  .build();
-            },
-            "Install Sandstorm devtools.")
-        .addSubCommand("reset-oauth",
-            [this]() {
-              return kj::MainBuilder(context, VERSION,
-                      "Resets the OAuth configuration of Meteor by deleting the configuration "
-                      "that is stored in Mongo.")
-                  .callAfterParsing(KJ_BIND_METHOD(*this, resetOauth))
-                  .build();
-            },
-            "Resets OAuth configuration.")
         .addSubCommand("continue",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                      "For internal use only: Continue running Sandstorm after an update. "
+                      "For internal use only: Continues running Sandstorm after an update. "
                       "This command is invoked by the Sandstorm server itself. Do not run it "
                       "directly.")
                   .addOption({"userns"}, [this]() { unsharedUidNamespace = true; return true; },
                       "Pass this flag if the parent has already set up and entered a UID "
                       "namespace.")
-                  .expectArg("<pidfile-fd>", KJ_BIND_METHOD(*this, continue_))
+                  .expectArg("<pidfile-fd>", KJ_BIND_METHOD(*this, inheritPidfileFd))
+                  .expectZeroOrMoreArgs("<fd>:tcp:<port>", KJ_BIND_METHOD(*this, inheritFd))
+                  .callAfterParsing(KJ_BIND_METHOD(*this, continue_))
                   .build();
             },
             "For internal use only.")
         .addSubCommand("dev",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                      "For internal use only: Run an app in dev mode. This command is "
+                      "For internal use only: Runs an app in dev mode. This command is "
                       "invoked by the `spk` tool. Do not run it directly.")
                   .callAfterParsing(KJ_BIND_METHOD(*this, dev))
                   .build();
             },
             "For internal use only.")
-        .addSubCommand("supervise",
+        .addSubCommand("admin-token",
             [this]() {
               return kj::MainBuilder(context, VERSION,
-                      "Run a sandstorm-supervisor process inside the server's namespace. This is "
-                      "mainly used to make it easier to run the front-end in dev mode.")
-                  .expectZeroOrMoreArgs("<supervisor-args>",
-                      KJ_BIND_METHOD(*this, addSuperviseArg))
-                  .callAfterParsing(KJ_BIND_METHOD(*this, supervise))
+                      "Generates a new admin token that you can use to access the admin settings "
+                      "page. This is meant for initial setup, or if an admin account is locked out.")
+                  .addOption({'q', "quiet"}, [this]() { shortOutput = true; return true; },
+                      "Output only the token.")
+                  .callAfterParsing(KJ_BIND_METHOD(*this, adminToken))
                   .build();
             },
-            "For internal use only.")
+            "Generate admin token.")
+        .addSubCommand("uninstall",
+            [this]() {
+              return kj::MainBuilder(context, VERSION,
+                      "Uninstalls Sandstorm.")
+                  .addOption({"delete-user-data"}, [this]() { deleteUserData = true; return true; },
+                      "Also delete all user data.")
+                  .callAfterParsing(KJ_BIND_METHOD(*this, uninstall))
+                  .build();
+            },
+            "Uninstall Sandstorm.")
         .build();
   }
 
@@ -775,12 +703,57 @@ public:
     // Detach from controlling terminal and make ourselves session leader.
     KJ_SYSCALL(setsid());
 
-    runUpdateMonitor(config, pidfile);
+    FdBundle fdBundle(config);
+
+    runUpdateMonitor(config, fdBundle, pidfile);
   }
 
-  kj::MainBuilder::Validity continue_(kj::StringPtr pidfileFdStr) {
+  kj::MainBuilder::Validity inheritFd(kj::StringPtr mapping) {
+    auto parts = split(mapping, ':');
+    if (parts.size() != 3) {
+      return "invalid syntax for port mapping";
+    }
+
+    int fd;
+    KJ_IF_MAYBE(p, parseUInt(kj::str(parts[0]), 10)) {
+      fd = *p;
+    } else {
+      return "invalid fd";
+    }
+
+    kj::String type = kj::str(parts[1]);
+    if (type != "tcp") {
+      return "invalid type";
+    }
+
+    uint port;
+    KJ_IF_MAYBE(p, parseUInt(kj::str(parts[2]), 10)) {
+      port = *p;
+    } else {
+      return "invalid port";
+    }
+
+    KJ_SYSCALL(ioctl(fd, FIOCLEX));  // set CLOEXEC
+    if (!inheritedTcpPorts.insert(std::make_pair(port, kj::AutoCloseFd(fd))).second) {
+      return "duplicate port";
+    }
+
+    return true;
+  }
+
+  kj::MainBuilder::Validity inheritPidfileFd(kj::StringPtr pidfileFdStr) {
+    KJ_IF_MAYBE(p, parseUInt(pidfileFdStr, 10)) {
+      inheritedPidfile = kj::AutoCloseFd(*p);
+      KJ_SYSCALL(ioctl(inheritedPidfile, FIOCLEX));  // set CLOEXEC
+      return true;
+    } else {
+      return "invalid fd";
+    }
+  }
+
+  kj::MainBuilder::Validity continue_() {
     if (getpid() != 1) {
-      return "This command is only internal use only.";
+      return "This command is for internal use only.";
     }
 
     if (unsharedUidNamespace) {
@@ -789,18 +762,16 @@ public:
       runningAsRoot = false;
     }
 
-    int pidfile = KJ_ASSERT_NONNULL(parseUInt(pidfileFdStr, 10));
-
-    // Make sure the pidfile is close-on-exec.
-    KJ_SYSCALL(fcntl(pidfile, F_SETFD, FD_CLOEXEC));
-
     changeToInstallDir();
     Config config = readConfig();
-    runUpdateMonitor(config, pidfile);
+    FdBundle fdBundle(config, kj::mv(inheritedTcpPorts));
+    runUpdateMonitor(config, fdBundle, inheritedPidfile);
   }
 
-  kj::MainBuilder::Validity stop() {
-    changeToInstallDir();
+  bool doStop() {
+    // Stop Sandstorm. Don't return until it's stopped. Returns false if it wasn't running to start
+    // with.
+    KJ_ASSERT(changedDir);
 
     registerAlarmHandler();
 
@@ -808,14 +779,14 @@ public:
     KJ_IF_MAYBE(pf, openPidfile()) {
       pidfile = kj::mv(*pf);
     } else {
-      context.exitInfo("Sandstorm is not running.");
+      return false;
     }
 
     pid_t pid;
     KJ_IF_MAYBE(p, getRunningPid(pidfile)) {
       pid = *p;
     } else {
-      context.exitInfo("Sandstorm is not running.");
+      return false;
     }
 
     context.warning(kj::str("Waiting for PID ", pid, " to terminate..."));
@@ -853,7 +824,17 @@ public:
       }
     }
 
-    context.exitInfo("Sandstorm server stopped.");
+    KJ_SYSCALL(alarm(0));
+    return true;
+  }
+
+  kj::MainBuilder::Validity stop() {
+    changeToInstallDir();
+    if (doStop()) {
+      context.exitInfo("Sandstorm server stopped.");
+    } else {
+      context.exitInfo("Sandstorm is not running.");
+    }
   }
 
   kj::MainBuilder::Validity startFe() {
@@ -926,7 +907,7 @@ public:
     dropPrivs(config.uids);
 
     // OK, run the Mongo client!
-    execMongoClient(config, {});
+    execMongoClient(config, {}, {});
     KJ_UNREACHABLE;
   }
 
@@ -966,39 +947,177 @@ public:
     }
   }
 
-  kj::MainBuilder::Validity devtools() {
-    auto dir = getInstallDir();
-    auto parent = kj::heapString(dir.slice(0, KJ_ASSERT_NONNULL(dir.findLast('/'))));
-
-    KJ_SYSCALL(access(kj::str(parent, "/latest").cStr(), F_OK),
-               "No \"latest\" symlink? Sandstorm doesn't seem to be installed the way I "
-               "expected it.");
-    KJ_SYSCALL(access(kj::str(parent, "/sandstorm").cStr(), F_OK),
-               "No \"sandstorm\" symlink? Sandstorm doesn't seem to be installed the way I "
-               "expected it.");
-
-    auto to = kj::str(devtoolsBindir, "/spk");
-    unlink(to.cStr());
-    KJ_SYSCALL(symlink(kj::str(parent, "/sandstorm").cStr(), to.cStr()));
-    context.exitInfo(kj::str("created: ", devtoolsBindir, "/spk"));
-  }
-
-  kj::MainBuilder::Validity resetOauth() {
+  kj::MainBuilder::Validity adminToken() {
     changeToInstallDir();
+    checkAccess();
 
-    // Verify that Sandstorm is running.
-    if (getRunningPid() == nullptr) {
-      context.exitError("Sandstorm is not running.");
+    // Get 20 random bytes for token.
+    kj::byte bytes[20];
+    randombytes_buf(bytes, sizeof(bytes));
+    auto hexString = hexEncode(bytes);
+
+    auto config = readConfig();
+
+    // Remove old token if present.
+    unlink("../var/sandstorm/adminToken");
+
+    {
+      auto tokenFd = raiiOpen("../var/sandstorm/adminToken",
+          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+      kj::FdOutputStream tokenFile(tokenFd.get());
+      KJ_SYSCALL(fchown(tokenFd, -1, config.uids.gid));
+      tokenFile.write(hexString.begin(), hexString.size());
     }
 
-    const Config config = readConfig();
+    if (shortOutput) {
+      context.exitInfo(hexString);
+    } else {
+      context.exitInfo(kj::str("Generated new admin token. Please proceed to:\n\n",
+        config.rootUrl, "/setup/token/", hexString, "\n\n"
+        "Here you can access the admin settings page and configure "
+        "your login system. You must visit the link within 15 minutes, after which you will have "
+        "24 hours to complete the setup process.  If you need more time, you can always generate "
+        "a new token with `sandstorm admin-token`."));
+    }
+  }
 
-    // We'll run under the chroot.
-    enterChroot(false);
+  kj::MainBuilder::Validity uninstall() {
+    auto bundleDir = getInstallDir();
+    auto sandstormHome = kj::str(bundleDir.slice(0, KJ_ASSERT_NONNULL(bundleDir.findLast('/'))));
 
-    mongoCommand(config, kj::str("db.meteor_accounts_loginServiceConfiguration.remove({})"));
+    changeToInstallDir();
+    checkAccess();
 
-    context.exitInfo(kj::str("reset OAuth configuration"));
+    // Make sure server is stopped.
+    if (doStop()) {
+      context.warning("Sandstorm stopped.");
+    } else {
+      context.warning("Sandstorm is not running.");
+    }
+
+    KJ_SYSCALL(chdir(sandstormHome.cStr()));
+
+    // Make extra-sure we're in a Sandstorm directory.
+    KJ_ASSERT(access("sandstorm", F_OK) >= 0 &&
+              access("sandstorm.conf", F_OK) >= 0 &&
+              access("latest", F_OK) >= 0 &&
+              sandstormHome != "/" &&
+              sandstormHome != "/usr",
+              "uninstaller is confused; bailing out to avoid doing any damage", sandstormHome);
+
+    bool hasCustomUser = fileHasLine("sandstorm.conf", "SERVER_USER=sandstorm");
+
+    // Delete Sandstorm bundles.
+    context.warning("Deleting installed Sandstorm bundles...");
+    static const kj::StringPtr BUNDLE_PREFIX = "sandstorm-";
+    for (auto& file: listDirectory(".")) {
+      if (file.startsWith(BUNDLE_PREFIX)) {
+        auto suffix = file.slice(BUNDLE_PREFIX.size());
+        if (parseUInt(suffix, 10) != nullptr || suffix.startsWith("custom.")) {
+          // Delete bundle.
+          recursivelyDelete(file);
+        }
+      }
+    }
+
+    // Delete symlinks.
+    KJ_SYSCALL(unlink("sandstorm"));
+    KJ_SYSCALL(unlink("latest"));
+
+    if (access("tmp", F_OK) >= 0) {
+      // Delete tmp since it's obviously not needed.
+      context.warning("Deleting temporary files...");
+      recursivelyDelete("tmp");
+    }
+
+    if (access("var", F_OK) >= 0) {
+      if (deleteUserData) {
+        // User wants to delete their user data... OK then.
+        context.warning("Deleting user data (per your request)...");
+        recursivelyDelete("var");
+        KJ_SYSCALL(unlink("sandstorm.conf"));
+      } else {
+        context.warning(kj::str("NOT deleting user data. Left at: ", sandstormHome, "/var"));
+      }
+    }
+
+    if (runningAsRoot) {
+      // Delete system-installed stuff. Be careful to verify that these files actually point at
+      // the installation of Sandstorm that we're removing, not some other installation that might
+      // be present on the machine.
+
+      bool seemsLikePrimarySandstorm = false;
+
+      // Remove `sandstorm` and `spk` command prefixes. Note that for historical reasons there are
+      // a few different places these might point, so we only check that they point somewhere under
+      // our Sandstorm install directory.
+      auto symlinkTargetPrefix = kj::str(sandstormHome, "/");
+
+      static const kj::StringPtr SANDSTORM_SYMLINK = "/usr/local/bin/sandstorm";
+      if (symlinkPointsInto(SANDSTORM_SYMLINK, symlinkTargetPrefix)) {
+        context.warning("Removing sandstorm command...");
+        KJ_SYSCALL(unlink(SANDSTORM_SYMLINK.cStr()));
+        seemsLikePrimarySandstorm = true;
+      }
+
+      static const kj::StringPtr SPK_SYMLINK = "/usr/local/bin/spk";
+      if (symlinkPointsInto(SPK_SYMLINK, symlinkTargetPrefix)) {
+        context.warning("Removing spk command...");
+        KJ_SYSCALL(unlink(SPK_SYMLINK.cStr()));
+      }
+
+      // SysV initscript. Remove if it inits this Sandstorm installation.
+      static const kj::StringPtr INITSCRIPT_FILE = "/etc/init.d/sandstorm";
+      auto initscriptLine = kj::str("DAEMON=", sandstormHome, "/sandstorm");
+      if (fileHasLine(INITSCRIPT_FILE, initscriptLine)) {
+        context.warning("Removing SysV initscript...");
+        KJ_SYSCALL(unlink(INITSCRIPT_FILE.cStr()));
+        system("update-rc.d sandstorm remove");
+      }
+
+      // systemd service file. Remove if it inits this Sandstorm installation.
+      static const kj::StringPtr SYSTEMD_FILE = "/etc/systemd/system/sandstorm.service";
+      auto systemdLine = kj::str("ExecStart=", sandstormHome, "/sandstorm start");
+      if (fileHasLine(SYSTEMD_FILE, systemdLine)) {
+        context.warning("Removing systemd service...");
+        system("systemctl disable sandstorm.service");
+        KJ_SYSCALL(unlink(SYSTEMD_FILE.cStr()));
+        system("systemctl daemon-reload");
+      }
+
+      if (seemsLikePrimarySandstorm) {
+        // Remove the sysctl modifications. Unfortunately this will break any other Sandstorm
+        // installations on the server, but it _looks_ like we're removing the primary
+        // installation.
+        kj::StringPtr SYSCTL_CONF = "/etc/sysctl.d/50-sandstorm.conf";
+        if (access(SYSCTL_CONF.cStr(), F_OK) >= 0) {
+          context.warning("Removing sysctl modifications...");
+          unlink(SYSCTL_CONF.cStr());
+        }
+
+        // Also check if the non-sysctl.d sysctl.conf was modified.
+        if (fileHasLine("/etc/sysctl.conf",
+            "# Enable non-root users to create sandboxes (needed by Sandstorm).")) {
+          context.warning("WARNING: /etc/sysctl.conf was modified by Sandstorm. Please edit "
+                          "it manually if you wish to undo these changes.");
+        }
+
+        if (hasCustomUser) {
+          context.warning("WARNING: A user account and group named 'sandstorm' were created to "
+                          "run the server. You may want to delete these manually if they are no "
+                          "longer needed. On most systems you can use these commands:\n\n"
+                          "  userdel sandstorm\n"
+                          "  groupdel sandstorm");
+        }
+      }
+    }
+
+    // Attempt to remove the Sandstorm home directory. This will fail if it isn't empty, but that's
+    // fine.
+    KJ_SYSCALL(chdir("/"));  // Can't delete directory if we're in it.
+    rmdir(sandstormHome.cStr());
+
+    context.exitInfo("Sandstorm has been uninstalled.");
   }
 
   kj::MainBuilder::Validity dev() {
@@ -1029,62 +1148,19 @@ public:
     return true;
   }
 
-  kj::MainBuilder::Validity supervise() {
-    changeToInstallDir();
-
-    // Verify that Sandstorm is running.
-    if (getRunningPid() == nullptr) {
-      context.exitError("Sandstorm is not running.");
-    }
-
-    // Connect to the devmode socket. The server daemon listens on this socket for commands.
-    // See `runDevDaemon()`.
-    auto sock = connectToDevDaemon();
-
-    // Send the command code.
-    kj::FdOutputStream((int)sock).write(&DEVMODE_COMMAND_SUPERVISE, 1);
-
-    // Forward our standard I/O FDs.
-    sendFd(sock, STDIN_FILENO);
-    sendFd(sock, STDOUT_FILENO);
-    sendFd(sock, STDERR_FILENO);
-
-    // Send supervisor args.
-    kj::FdOutputStream((int)sock).write(superviseArgs.begin(), superviseArgs.size());
-
-    // Send EOF.
-    KJ_SYSCALL(shutdown(sock, SHUT_WR));
-
-    // Wait for exit status.
-    int status;
-    kj::FdInputStream((int)sock).read(&status, sizeof(status));
-
-    if (WIFEXITED(status)) {
-      _exit(WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-      // Try to kill ourself with the same signal to emulate the same outcome.
-      KJ_SYSCALL(kill(getpid(), WTERMSIG(status)));
-      // Otherwise just report it.
-      context.exitError(kj::str("Supervisor terminated by signal: ", WTERMSIG(status)));
-    } else {
-      context.exitError("Supervisor terminated with status I didn't understand.");
-    }
-  }
-
-  kj::MainBuilder::Validity addSuperviseArg(kj::StringPtr arg) {
-    superviseArgs.addAll(arg);
-    superviseArgs.add('\0');
-    return true;
-  }
-
 private:
   kj::ProcessContext& context;
 
   kj::Own<AbstractMain> alternateMain;
   // Alternate main function we'll use depending on the program name.
 
+  kj::AutoCloseFd inheritedPidfile;
+  std::map<uint, kj::AutoCloseFd> inheritedTcpPorts;
+  // Pidfile and TCP ports inherited by "continue" command.
+
   struct Config {
-    uint port = 3000;
+    kj::Maybe<uint> httpsPort;
+    kj::Array<uint> ports;
     uint mongoPort = 3001;
     UserIds uids;
     kj::String bindIp = kj::str("127.0.0.1");
@@ -1093,21 +1169,22 @@ private:
     kj::String ddpUrl = nullptr;
     kj::String mailUrl = nullptr;
     kj::String updateChannel = nullptr;
+    kj::String sandcatsHostname = nullptr;
     bool allowDemoAccounts = false;
     bool isTesting = false;
     bool allowDevAccounts = false;
+    bool hideTroubleshooting = false;
+    uint smtpListenPort = 30025;
   };
 
   kj::String updateFile;
-  kj::StringPtr devtoolsBindir = "/usr/local/bin";
-
-  kj::Vector<char> superviseArgs;
 
   bool changedDir = false;
   bool unsharedUidNamespace = false;
-  bool kernelNewEnough = isKernelNewEnough();
   bool runningAsRoot = getuid() == 0;
   bool updateFileIsChannel = false;
+  bool shortOutput = false;
+  bool deleteUserData = false;
 
   kj::String getInstallDir() {
     char exeNameBuf[PATH_MAX + 1];
@@ -1121,6 +1198,19 @@ private:
   void changeToInstallDir() {
     KJ_SYSCALL(chdir(getInstallDir().cStr()));
     changedDir = true;
+  }
+
+  void checkAccess() {
+    KJ_ASSERT(changedDir);
+    if (access("../var/sandstorm", W_OK) == -1) {
+      if (errno == EACCES) {
+        KJ_FAIL_REQUIRE(
+            "Sandstorm was not run with appropriate privileges; rerun as root or the user for "
+            "which it was installed.");
+      } else {
+        KJ_FAIL_SYSCALL("access", errno);
+      }
+    }
   }
 
   void checkOwnedByRoot(kj::StringPtr path, kj::StringPtr title) {
@@ -1279,8 +1369,8 @@ private:
 
     // Bind var -> ../var, so that all versions share the same var.
     // Same for tmp, though we clear it on every startup.
-    KJ_SYSCALL(mount("../var", "var", nullptr, MS_BIND, nullptr));
-    KJ_SYSCALL(mount("../tmp", "tmp", nullptr, MS_BIND, nullptr));
+    KJ_SYSCALL(mount("../var", "var", nullptr, MS_BIND | MS_REC, nullptr));
+    KJ_SYSCALL(mount("../tmp", "tmp", nullptr, MS_BIND | MS_REC, nullptr));
 
     // Bind devices from /dev into our chroot environment.
     // We can't bind /dev itself because this is apparently not allowed when in a UID namespace
@@ -1289,12 +1379,41 @@ private:
     KJ_SYSCALL(mount("/dev/zero", "dev/zero", nullptr, MS_BIND, nullptr));
     KJ_SYSCALL(mount("/dev/random", "dev/random", nullptr, MS_BIND, nullptr));
     KJ_SYSCALL(mount("/dev/urandom", "dev/urandom", nullptr, MS_BIND, nullptr));
-    KJ_SYSCALL(mount("/dev/fuse", "dev/fuse", nullptr, MS_BIND, nullptr));
 
-    // Mount a tmpfs at /etc and copy over necessary config files from the host.
+    if (runningAsRoot && access("/dev/fuse", F_OK) == 0) {
+      // Bring in FUSE just in case we need it for "spk dev".
+      // TODO(cleanup): We should probably instead open /dev/fuse in the "spk" command (i.e.
+      //   outside the namespace) and then pass the FD to the server.
+      KJ_SYSCALL(mount("/dev/fuse", "dev/fuse", nullptr, MS_BIND, nullptr));
+    }
+
+    // Bind in the host's /etc as /etc.host.
+    // As noted in backup.c++, MS_BIND does not respect mount flags on the initial bind, and
+    // we have to issue a remount to set them.  Because the host /etc may have been mounted nosuid,
+    // nodev, and noexec, we also add those flags here lest mount() think we're trying to remove
+    // them (which would cause mount() to fail).  We also need MS_REC because the host may have
+    // mounted other FSes under /etc, and we need to recursively rebind those.
+    KJ_SYSCALL(mount("/etc", "etc.host", nullptr, MS_BIND | MS_REC, nullptr));
+    KJ_SYSCALL(mount("/etc", "etc.host", nullptr,
+                     MS_BIND | MS_REC | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                     nullptr));
+    // Then do the same for /run.
+    KJ_SYSCALL(mount("/run", "run.host", nullptr, MS_BIND | MS_REC, nullptr));
+    KJ_SYSCALL(mount("/run", "run.host", nullptr,
+                     MS_BIND | MS_REC | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                     nullptr));
+
+    // Mount a tmpfs at /run.
+    KJ_SYSCALL(mount("tmpfs", "run", "tmpfs", MS_NOSUID | MS_NOEXEC,
+                     kj::str("size=2m,nr_inodes=128,mode=755", tmpfsUidOpts).cStr()));
+    // Mount a tmpfs at /etc.
     KJ_SYSCALL(mount("tmpfs", "etc", "tmpfs", MS_NOSUID | MS_NOEXEC,
                      kj::str("size=2m,nr_inodes=128,mode=755", tmpfsUidOpts).cStr()));
-    copyEtc();
+    // Symlink in necessary config files from the host, as described in the bundle's host.list
+    linkHostFiles();
+    // And just in case the user has /etc/resolv.conf as a symlink to something we haven't linked
+    // in, copy its contents to /etc/resolv.conf.host-initial so we can use that if needed.
+    backupResolvConf();
 
     // OK, change our root directory.
     KJ_SYSCALL(syscall(SYS_pivot_root, ".", "tmp"));
@@ -1303,24 +1422,54 @@ private:
 
     // The environment inherited from the host is probably no good for us. E.g. an oddball
     // locale setting can crash Mongo because we don't have the appropriate locale files available.
+    //
+    // That said, there are a few environment variables that we do re-export.
+    std::map<const char*, kj::String> envVars;
+    static const char* const KEEP_VARS[] = {"http_proxy", "https_proxy"};
+    for (const char* varName: KEEP_VARS) {
+      const char* envValue = getenv(varName);
+      if (envValue != nullptr) {
+        envVars.insert(std::make_pair(varName, kj::str(envValue)));
+      }
+    }
     KJ_SYSCALL(clearenv());
 
     // Set up an environment appropriate for us.
     KJ_SYSCALL(setenv("LANG", "C.UTF-8", true));
     KJ_SYSCALL(setenv("PATH", "/usr/bin:/bin", true));
     KJ_SYSCALL(setenv("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib:/lib", true));
+
+    // Copy any remaining environment variables in that we captured.
+    for (auto& entry: envVars) {
+      KJ_SYSCALL(setenv(entry.first, entry.second.cStr(), true));
+    }
+
+    // See if /etc/resolv.conf exists, and if not, try replacing it with the backup made earlier.
+    restoreResolvConfIfNeeded();
   }
 
-  void dropPrivs(const UserIds& uids) {
+  void dropPrivs(const UserIds& uids, bool keepRealUid = false) {
+    // Defense in depth: Don't give my children any new caps for any reason.
+    KJ_SYSCALL(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+
     if (runningAsRoot) {
       KJ_SYSCALL(setresgid(uids.gid, uids.gid, uids.gid));
       KJ_SYSCALL(setgroups(uids.groups.size(), uids.groups.begin()));
-      KJ_SYSCALL(setresuid(uids.uid, uids.uid, uids.uid));
+
+      if (keepRealUid) {
+        // We're prepping to run the backend and user namespaces are not available, therefore the
+        // backend needs to keep its superuser powers stashed in order to hand them off to the
+        // grain supervisors so that they can set up sandboxes. Instead of creating a suid binary
+        // (with all the danger that entails), we merely drop the effective UID, but raise it again
+        // when invoking the supervisor.
+        KJ_SYSCALL(seteuid(uids.uid));
+      } else {
+        KJ_SYSCALL(setresuid(uids.uid, uids.uid, uids.uid));
+      }
     } else {
       // We're using UID namespaces.
 
-      // Defense in depth: Don't give my children any new caps for any reason.
-      KJ_SYSCALL(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0));
+      KJ_ASSERT(!keepRealUid);
 
       // Defense in depth: Drop all capabilities from the set of caps which my children are allowed
       //   to ever have.
@@ -1353,18 +1502,58 @@ private:
     KJ_SYSCALL(sigprocmask(SIG_SETMASK, &sigset, nullptr));
   }
 
-  void copyEtc() {
-    auto files = splitLines(readAll("etc.list"));
+  void linkHostFiles() {
+    // We will create a symlink for the first child of /etc or /run named in each line of host.list to
+    // symlink that file or folder from the host into the /etc or /run tmpfs.
+    auto files = splitLines(readAll("host.list"));
 
     // Now copy over each file.
     for (auto& file: files) {
-      if (access(file.cStr(), R_OK) == 0) {
-        auto in = raiiOpen(file, O_RDONLY);
-        auto out = raiiOpen(kj::str(".", file), O_WRONLY | O_CREAT | O_EXCL);
-        ssize_t n;
-        do {
-          KJ_SYSCALL(n = sendfile(out, in, nullptr, 1 << 20));
-        } while (n > 0);
+      auto pathElements = split(file, '/');
+      KJ_REQUIRE(pathElements.size() >= 3, "invalid path", file);
+      KJ_REQUIRE(pathElements[0].size() == 0,"relative path given in host.list", file);
+      auto firstDir = kj::str(pathElements[1]);
+      KJ_REQUIRE(firstDir == "etc" || firstDir == "run", "host.list asked to symlink in file outside of /etc/ or /run/", file);
+      auto child = pathElements[2];
+      auto linkTargetAsSeenByLink = kj::str("../", firstDir, ".host/", child);
+      auto linkToCreate = kj::str("./", firstDir, "/", child);
+
+      // Only attempt to create the symlink if we haven't created it already.
+      struct stat stats;
+      if (lstat(linkToCreate.cStr(), &stats) < 0 && errno == ENOENT) {
+        KJ_SYSCALL(symlink(linkTargetAsSeenByLink.cStr(), linkToCreate.cStr()));
+      }
+    }
+  }
+
+  void backupResolvConf() {
+    if (access("/etc/resolv.conf", R_OK) == 0) {
+      auto in = raiiOpen("/etc/resolv.conf", O_RDONLY);
+      auto out = raiiOpen("./etc/resolv.conf.host-initial", O_WRONLY | O_CREAT | O_EXCL);
+      ssize_t n;
+      do {
+        KJ_SYSCALL(n = sendfile(out, in, nullptr, 1 << 20));
+      } while (n > 0);
+    } else {
+      context.warning("WARNING: Couldn't read host's /etc/resolv.conf, DNS may be broken");
+    }
+  }
+
+  void restoreResolvConfIfNeeded() {
+    struct stat stats;
+    if (stat("/etc/resolv.conf", &stats) < 0) {
+      auto error = errno;
+      if (error == ENOENT) {
+        if (access("/etc/resolv.conf.host-initial", R_OK) == 0) {
+          context.warning("WARNING: /etc/resolv.conf is unreachable from container, "
+                          "using backup from host");
+          KJ_SYSCALL(rename("/etc/resolv.conf.host-initial", "/etc/resolv.conf"));
+        } else {
+          context.warning("WARNING: Wanted to fall back to /etc/resolv.conf.host-initial, "
+                          "but it is unavailable.  Carrying on without DNS.");
+        }
+      } else {
+        KJ_FAIL_SYSCALL("stat('/etc/resolv.conf')", error);
       }
     }
   }
@@ -1382,6 +1571,10 @@ private:
     config.uids.uid = getuid();
     config.uids.gid = getgid();
 
+    // Store the PORT and HTTPS_PORT values in variables here so we can
+    // process them at the end.
+    kj::Maybe<kj::String> maybePortValue = nullptr;
+
     auto lines = splitLines(readAll("../sandstorm.conf"));
     for (auto& line: lines) {
       auto equalsPos = KJ_ASSERT_NONNULL(line.findFirst('='), "Invalid config line", line);
@@ -1395,12 +1588,14 @@ private:
         } else {
           KJ_FAIL_REQUIRE("invalid config value SERVER_USER", value);
         }
-      } else if (key == "PORT") {
+      } else if (key == "HTTPS_PORT") {
         KJ_IF_MAYBE(p, parseUInt(value, 10)) {
-          config.port = *p;
+          config.httpsPort = *p;
         } else {
-          KJ_FAIL_REQUIRE("invalid config value PORT", value);
+          KJ_FAIL_REQUIRE("invalid config value HTTPS_PORT", value);
         }
+      } else if (key == "PORT") {
+          maybePortValue = kj::mv(value);
       } else if (key == "MONGO_PORT") {
         KJ_IF_MAYBE(p, parseUInt(value, 10)) {
           config.mongoPort = *p;
@@ -1410,7 +1605,13 @@ private:
       } else if (key == "BIND_IP") {
         config.bindIp = kj::mv(value);
       } else if (key == "BASE_URL") {
-        config.rootUrl = kj::mv(value);
+        // If the value ends in any number of "/" characters, remove them now. This allows the
+        // Sandstorm codebase to assume that BASE_URL does not end in a slash.
+        int desiredLength = value.size();
+        while (desiredLength > 0 && value[desiredLength-1] == '/') {
+          desiredLength -= 1;
+        }
+        config.rootUrl = kj::str(value.slice(0, desiredLength));
       } else if (key == "WILDCARD_HOST") {
         config.wildcardHost = kj::mv(value);
       } else if (key == "WILDCARD_PARENT_URL") {
@@ -1433,13 +1634,34 @@ private:
         } else {
           config.updateChannel = kj::mv(value);
         }
+      } else if (key == "SANDCATS_BASE_DOMAIN") {
+        config.sandcatsHostname = kj::mv(value);
       } else if (key == "ALLOW_DEMO_ACCOUNTS") {
         config.allowDemoAccounts = value == "true" || value == "yes";
       } else if (key == "ALLOW_DEV_ACCOUNTS") {
         config.allowDevAccounts = value == "true" || value == "yes";
       } else if (key == "IS_TESTING") {
         config.isTesting = value == "true" || value == "yes";
+      } else if (key == "HIDE_TROUBLESHOOTING") {
+        config.hideTroubleshooting = value == "true" || value == "yes";
+      } else if (key == "SMTP_LISTEN_PORT") {
+        KJ_IF_MAYBE(p, parseUInt(value, 10)) {
+          config.smtpListenPort = *p;
+        } else {
+          KJ_FAIL_REQUIRE("invalid config value SMTP_LISTEN_PORT", value);
+        }
       }
+    }
+
+    // Now process the PORT setting, since the actual value in config.ports
+    // depends on if HTTPS_PORT was provided at any point in reading the
+    // config file.
+    //
+    // Outer KJ_IF_MAYBE so we only run this code if the config file contained
+    // a PORT= declaration.
+    KJ_IF_MAYBE(portValue, maybePortValue) {
+      auto ports = parsePorts(config.httpsPort, *portValue);
+      config.ports = kj::mv(ports);
     }
 
     if (runningAsRoot) {
@@ -1449,37 +1671,173 @@ private:
     return config;
   }
 
-  [[noreturn]] void runUpdateMonitor(const Config& config, int pidfile) {
+  class FdBundle {
+    // Represents the bundle of file descriptors that we open early and then pass into the
+    // frontend. Currently this is only TCP listen ports.
+
+  public:
+    FdBundle(const Config& config,
+             std::map<uint, kj::AutoCloseFd> inherited = std::map<uint, kj::AutoCloseFd>())
+        // STDERR + 1 (fd after STDERR) + HTTP ports + SMTP port
+        : minFd(STDERR_FILENO + 1 + config.ports.size() + 1) {
+      int targetFd = STDERR_FILENO + 1;
+      openPort(config, config.smtpListenPort, targetFd++, inherited);
+      for (auto& port: config.ports) {
+        openPort(config, port, targetFd++, inherited);
+      }
+      KJ_ASSERT(minFd == targetFd);
+    }
+
+    FdBundle(decltype(nullptr)): minFd(0) {};
+
+    void closeAll() {
+      ports.clear();
+    }
+
+    kj::Array<kj::String> prepareForContinue() {
+      auto args = kj::heapArrayBuilder<kj::String>(ports.size());
+      for (auto& port: ports) {
+        args.add(kj::str(port.second.fd.get(), ":tcp:", port.first));
+        KJ_SYSCALL(ioctl(port.second.fd, FIONCLEX));
+      }
+      return args.finish();
+    }
+
+    void prepareInheritedFds() {
+      for (auto& port: ports) {
+        KJ_SYSCALL(dup2(port.second.fd, port.second.targetFd));
+      }
+    }
+
+  private:
+    struct FdInfo {
+      kj::AutoCloseFd fd;
+      int targetFd;  // FD number to use when passing to Node.
+    };
+
+    int minFd;
+    std::map<uint, FdInfo> ports;
+
+    void openPort(const Config& config, uint port, int targetFd,
+                  std::map<uint, kj::AutoCloseFd>& inherited) {
+      auto iter = inherited.find(port);
+      if (iter != inherited.end()) {
+        ports.insert(std::make_pair(port, FdInfo { ensureMinFd(kj::mv(iter->second)), targetFd }));
+        inherited.erase(iter);
+        return;
+      }
+
+      sockaddr_storage sa;
+      sockaddr_in* sa4 = reinterpret_cast<sockaddr_in*>(&sa);
+      sockaddr_in6* sa6 = reinterpret_cast<sockaddr_in6*>(&sa);
+
+      // Various syscalls require slightly different arguments for v4 and v6 addresses.
+      // Keep track of which we're trying.
+      bool useV6 = false;
+
+      memset(&sa, 0, sizeof sa);
+
+      sa.ss_family = AF_INET;
+      int rc = inet_pton(AF_INET, config.bindIp.cStr(), &(sa4->sin_addr));
+
+      if (rc == 0) {
+        // If IPv4 address parsing fails, try IPv6
+        useV6 = true;
+        sa.ss_family = AF_INET6;
+        rc = inet_pton(AF_INET6, config.bindIp.cStr(), &(sa6->sin6_addr));
+        KJ_REQUIRE(rc == 1, "Bind IP is an invalid IP address:", config.bindIp);
+      }
+
+      int sockFd_;
+
+      if (useV6) {
+        KJ_SYSCALL(sockFd_ = socket(
+            AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP));
+      } else {
+        KJ_SYSCALL(sockFd_ = socket(
+            AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP));
+      }
+      kj::AutoCloseFd sockFd(sockFd_);
+
+      // Enable SO_REUSEADDR so that `sandstorm restart` doesn't take minutes to succeed.
+      int optval = 1;
+      KJ_SYSCALL(setsockopt(sockFd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)));
+
+      if (useV6) {
+        sa6->sin6_port = htons(port);
+        KJ_SYSCALL(bind(sockFd, reinterpret_cast<sockaddr *>(&sa), sizeof(sockaddr_in6)));
+      } else {
+        sa4->sin_port = htons(port);
+        KJ_SYSCALL(bind(sockFd, reinterpret_cast<sockaddr *>(&sa), sizeof(sockaddr_in)));
+      }
+
+      KJ_SYSCALL(listen(sockFd, SOMAXCONN));
+
+      ports.insert(std::make_pair(port, FdInfo { ensureMinFd(kj::mv(sockFd)), targetFd}));
+    }
+
+    kj::AutoCloseFd ensureMinFd(kj::AutoCloseFd fd) {
+      if (fd.get() < minFd) {
+        // Push the FD number beyond our minimum.
+        int fd_;
+        KJ_SYSCALL(fd_ = fcntl(fd, F_DUPFD_CLOEXEC, minFd));
+        fd = kj::AutoCloseFd(fd_);
+        KJ_ASSERT(fd.get() >= minFd);
+      }
+      return kj::mv(fd);
+    }
+  };
+
+  [[noreturn]] void runUpdateMonitor(const Config& config, FdBundle& fdBundle, int pidfile) {
     // Run the update monitor process.  This process runs two subprocesses:  the sandstorm server
     // and the auto-updater.
 
-    // Fix permissions on pidfile. We do this here rather than back where we opened it because
-    // a previous version failed to do this and we want it fixed immediately on upgrade.
     if (runningAsRoot) {
+      // Fix permissions on pidfile. We do this here rather than back where we opened it because
+      // a previous version failed to do this and we want it fixed immediately on upgrade.
       KJ_SYSCALL(fchown(pidfile, 0, config.uids.gid));
       KJ_SYSCALL(fchmod(pidfile, 0660));
+
+      // Additionally, fix permissions on sandcats-related data, which was originally owned by root
+      fixSandcatsPermissions(config);
+
+      // Fix permissions on /var/sandstorm, which was originally owned by root:root.
+      KJ_SYSCALL(chown("../var/sandstorm", 0, config.uids.gid));
+      KJ_SYSCALL(chmod("../var/sandstorm", 0770));
+
+      // Fix permissions on /var/sandstorm/grains, which originally had mode 0730 because grain
+      // IDs were secret.
+      KJ_SYSCALL(chmod("../var/sandstorm/grains", 0770));
     }
 
     cleanupOldVersions();
 
     // Clean up the temp directory.
     KJ_REQUIRE(changedDir);
-    if (access("../tmp", F_OK) == 0) {
-      recursivelyDelete("../tmp");
-    }
-    mkdir("../tmp", 0770);
-    KJ_SYSCALL(chmod("../tmp", 0770));
-    if (runningAsRoot) {
-      KJ_SYSCALL(chown("../tmp", 0, config.uids.gid));
+
+    static const char* const TMPDIRS[2] = { "../tmp", "../var/sandstorm/tmp" };
+    for (const char* tmpDir: TMPDIRS) {
+      KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
+        if (access(tmpDir, F_OK) == 0) {
+          recursivelyDelete(tmpDir);
+        }
+        mkdir(tmpDir, 0770);
+        KJ_SYSCALL(chmod(tmpDir, 0770 | S_ISVTX));
+        if (runningAsRoot) {
+          KJ_SYSCALL(chown(tmpDir, 0, config.uids.gid));
+        }
+      })) {
+        KJ_LOG(WARNING, "failed to clean up tmpdir; leaving it for now", tmpDir, *exception);
+      }
     }
 
     auto sigfd = prepareMonitoringLoop();
 
-    pid_t updaterPid = startUpdater(config, false);
+    pid_t updaterPid = startUpdater(config, fdBundle, false);
 
     pid_t sandstormPid = fork();
     if (sandstormPid == 0) {
-      runServerMonitor(config);
+      runServerMonitor(config, fdBundle);
       KJ_UNREACHABLE;
     }
 
@@ -1512,16 +1870,26 @@ private:
         if (updaterSucceeded) {
           context.warning("** Restarting to apply update");
           killChild("Server Monitor", sandstormPid);
-          restartForUpdate(pidfile);
+          restartForUpdate(pidfile, fdBundle);
           KJ_UNREACHABLE;
         } else if (updaterDied) {
           context.warning("** Updater died; restarting it");
-          updaterPid = startUpdater(config, true);
+          updaterPid = startUpdater(config, fdBundle, true);
         } else if (sandstormDied) {
           context.exitError("** Server monitor died. Aborting.");
           KJ_UNREACHABLE;
         }
       } else if (siginfo.ssi_signo == SIGINT) {
+        // Frontend startup or shutdown request, used with run-dev.
+
+        if (!siginfo.ssi_int) {
+          // We have to close all the listen ports otherwise run-dev won't be able to open them
+          // for itself. Note that we never re-open them here in the parent process, meaning that
+          // if you stop-fe and then start-fe and then do an update, you won't get a zero-downtime
+          // update. This only affects developers so whatever.
+          fdBundle.closeAll();
+        }
+
         // Pass along to server monitor.
         union sigval sigval;
         memset(&sigval, 0, sizeof(sigval));
@@ -1541,7 +1909,7 @@ private:
         // Handle signal.
         if (siginfo.ssi_signo == SIGHUP) {
           context.warning("** Restarting");
-          restartForUpdate(pidfile);
+          restartForUpdate(pidfile, fdBundle);
         } else {
           // SIGTERM or something.
           context.exitInfo("** Exiting");
@@ -1551,7 +1919,7 @@ private:
     }
   }
 
-  [[noreturn]] void runServerMonitor(const Config& config) {
+  [[noreturn]] void runServerMonitor(const Config& config, FdBundle& fdBundle) {
     // Run the server monitor, which runs node and mongo and deals with them dying.
 
     enterChroot(true);
@@ -1564,14 +1932,18 @@ private:
 
     auto sigfd = prepareMonitoringLoop();
 
+    context.warning("** Starting back-end...");
+    pid_t backendPid = startBackend(config, fdBundle);
+    uint64_t backendStartTime = getTime();
+
     context.warning("** Starting MongoDB...");
-    pid_t mongoPid = startMongo(config);
+    pid_t mongoPid = startMongo(config, fdBundle);
     int64_t mongoStartTime = getTime();
 
     // Create the mongo user if it hasn't been created already.
-    maybeCreateMongoUser(config);
+    maybeCreateMongoUser(config, fdBundle);
 
-    context.warning("** Mongo started; now starting front-end...");
+    context.warning("** Back-end and Mongo started; now starting front-end...");
 
     // If we're root, run the dev daemon. At present the dev daemon requires root (in order to
     // use FUSE), so we don't run it if we aren't root.
@@ -1584,6 +1956,7 @@ private:
         sigfd = nullptr;
         clearSignalMask();
         KJ_SYSCALL(signal(SIGALRM, SIG_DFL));
+        fdBundle.closeAll();
         runDevDaemon(config);
         KJ_UNREACHABLE;
       }
@@ -1592,7 +1965,7 @@ private:
       context.warning("Note: Not accepting \"spk dev\" connections because not running as root.");
     }
 
-    pid_t nodePid = startNode(config);
+    pid_t nodePid = startNode(config, fdBundle);
     int64_t nodeStartTime = getTime();
 
     for (;;) {
@@ -1606,6 +1979,7 @@ private:
         // which is us.
 
         // Reap zombies until there are no more.
+        bool backendDied = false;
         bool mongoDied = false;
         bool nodeDied = false;
         for (;;) {
@@ -1614,6 +1988,8 @@ private:
           if (deadPid <= 0) {
             // No more zombies.
             break;
+          } else if (deadPid == backendPid) {
+            backendDied = true;
           } else if (deadPid == mongoPid) {
             mongoDied = true;
           } else if (deadPid == nodePid) {
@@ -1626,13 +2002,27 @@ private:
         }
 
         // Deal with mongo or node dying.
+        if (backendDied) {
+          maybeWaitAfterChildDeath("Back-end", backendStartTime);
+          backendPid = startBackend(config, fdBundle);
+          backendStartTime = getTime();
+        }
         if (mongoDied) {
           maybeWaitAfterChildDeath("MongoDB", mongoStartTime);
-          mongoPid = startMongo(config);
+          mongoPid = startMongo(config, fdBundle);
           mongoStartTime = getTime();
-        } else if (nodeDied) {
+        }
+        if (nodeDied) {
           maybeWaitAfterChildDeath("Front-end", nodeStartTime);
-          nodePid = startNode(config);
+          nodePid = startNode(config, fdBundle);
+          nodeStartTime = getTime();
+        }
+
+        if (mongoDied && !nodeDied) {
+          // If the back-end died then we unfortunately need to restart node as well.
+          context.warning("** Restarting front-end due to back-end failure");
+          killChild("Front-end", nodePid);
+          nodePid = startNode(config, fdBundle);
           nodeStartTime = getTime();
         }
       } else if (siginfo.ssi_signo == SIGINT) {
@@ -1640,7 +2030,8 @@ private:
           // Requested startup of front-end after previous shutdown.
           if (nodePid == 0) {
             context.warning("** Starting front-end by admin request");
-            nodePid = startNode(config);
+            fdBundle = FdBundle(config);  // re-open FDs
+            nodePid = startNode(config, fdBundle);
             nodeStartTime = getTime();
           } else {
             context.warning("** Request to start front-end, but it is already running");
@@ -1650,24 +2041,63 @@ private:
           context.warning("** Shutting down front-end by admin request");
           killChild("Front-end", nodePid);
           nodePid = 0;
+
+          // We have to close the FD bundle otherwise run-dev won't work.
+          fdBundle.closeAll();
         }
       } else {
         // SIGTERM or something.
         context.warning("** Shutting down due to signal");
         killChild("Front-end", nodePid);
         killChild("MongoDB", mongoPid);
+        killChild("Back-end", backendPid);
         killChild("Dev daemon", devDaemonPid);
         context.exit();
       }
     }
   }
 
-  pid_t startMongo(const Config& config) {
-    pid_t outerPid;
-    KJ_SYSCALL(outerPid = fork());
-    if (outerPid == 0) {
+  pid_t startMongo(const Config& config, FdBundle& fdBundle) {
+    Subprocess process([&]() -> int {
+      fdBundle.closeAll();
       dropPrivs(config.uids);
       clearSignalMask();
+
+      // Before starting Mongo, we remove "mongod.lock" basically unconditionally.
+      //
+      // Here's how MongoDB wants to use this lockfile: If MongoDB stopped abruptly in the past, and
+      // there is no journal, then MongoDB wants to prompt the admin to start it with
+      // --recover. Presumably it refuses to repair automatically in the absence of a journal
+      // because it can't always be sure of how to do recovery.
+      //
+      // If replica sets are enabled, MongoDB would prefer to ask the admin to restore it from a
+      // replica. Indeed, we do have replica sets enabled. But we can't restore from a replica
+      // because there is just "one replica" -- replica sets are enabled merely to enable Meteor to
+      // do oplog tailing.
+      //
+      // In our case, we do have journaling enabled, and we have no replica we can restore from, so
+      // in the case of crash, the best we can do is ask MongoDB to start itself up and restore from
+      // journal. That's what removing the lock file means.
+      //
+      // See http://docs.mongodb.org/manual/reference/command/repairDatabase/ and
+      // http://docs.mongodb.org/manual/tutorial/recover-data-following-unexpected-shutdown/ for
+      // more information.
+      kj::String lockFilePath = kj::str("/var/mongo/mongod.lock");
+      if (access(lockFilePath.cStr(), F_OK) == 0) {
+        kj::String contents = trim(readAll(raiiOpen(lockFilePath.cStr(), O_RDONLY)));
+        if (contents != "") {
+          // This file should contain a PID, hence UInt.
+          //
+          // If somehow there are two instances of Sandstorm running, and the other one is running a
+          // mongod, then this action could dangerously cause two mongod instances to be
+          // running. However, in that case, we also can't see the other process, since it's in a
+          // pid namespace. So this is all the sanity-checking we can do.
+          KJ_ASSERT_NONNULL(parseUInt(contents, 10),
+                            "mongod.lock exists & contains non-integer, refusing to unlink");
+          context.warning("Found a stale mongod lock file. Removing it.");
+          unlink(lockFilePath.cStr());
+        }
+      }
 
       KJ_SYSCALL(execl("/bin/mongod", "/bin/mongod", "--fork",
           "--bind_ip", "127.0.0.1", "--port", kj::str(config.mongoPort).cStr(),
@@ -1677,36 +2107,44 @@ private:
           "--replSet", "ssrs", "--oplogSize", "16",
           EXEC_END_ARGS));
       KJ_UNREACHABLE;
-    }
+    });
 
     // Wait for mongod to return, meaning the database is up.  Then get its real pid via the
     // pidfile.
-    int status;
-    KJ_SYSCALL(waitpid(outerPid, &status, 0));
+    auto status = process.waitForExit();
 
-    KJ_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-        "MongoDB failed on startup. Check var/log/mongo.log.");
+    if (status == 0) {
+      // Even after the startup command exits, MongoDB takes exactly two seconds to elect itself as
+      // master of the repl set (of which it is the only damned member). Unforutnately, if Node
+      // connects during this time, it fails, sometimes without actually exiting, leaving the entire
+      // server hosed. It appears that this always takes exactly two seconds from startup, since
+      // MongoDB does some sort of heartbeat every second where it checks the replset status, and it
+      // takes three of these for the election to complete, and the first of the three happens
+      // immediately on startup, meaning the last one is two seconds in. So, we'll sleep for 3
+      // seconds to be safe.
+      // TODO(cleanup): There must be a better way...
+      int n = 3;
+      while (n > 0) n = sleep(n);
+      KJ_IF_MAYBE(mongoPid, parseUInt(trim(readAll("/var/pid/mongo.pid")), 10)) {
+        return *mongoPid;
+      }
+    }
 
-    // Even after the startup command exits, MongoDB takes exactly two seconds to elect itself as
-    // master of the repl set (of which it is the only damned member). Unforutnately, if Node
-    // connects during this time, it fails, sometimes without actually exiting, leaving the entire
-    // server hosed. It appears that this always takes exactly two seconds from startup, since
-    // MongoDB does some sort of heartbeat every second where it checks the replset status, and it
-    // takes three of these for the election to complete, and the first of the three happens
-    // immediately on startup, meaning the last one is two seconds in. So, we'll sleep for 3
-    // seconds to be safe.
-    // TODO(cleanup): There must be a better way...
-    int n = 3;
-    while (n > 0) n = sleep(n);
-
-    return KJ_ASSERT_NONNULL(parseUInt(trim(readAll("/var/pid/mongo.pid")), 10));
+    // If we got here, mongod either exited non-zero, or has no PID in its pidfile. In that case,
+    // we do not know how proceed.
+    KJ_FAIL_ASSERT("**mongod failed to start. Initial exit code: ", status,
+                   "bailing out now. For troubleshooting, read "
+                   "/opt/sandstorm/var/log/mongo.log (or var/log/mongo.log within your Sandstorm "
+                   "if installed to a different place) and visit: "
+                   "https://docs.sandstorm.io/en/latest/search.html?q=mongod+failed+to+start");
+    return 0;
   }
 
-  void maybeCreateMongoUser(const Config& config) {
+  void maybeCreateMongoUser(const Config& config, FdBundle& fdBundle) {
     if (access("/var/mongo/passwd", F_OK) != 0) {
       // We need to initialize the repl set to get oplog tailing. Our set isn't actually much of a
       // set since it only contains one instance, but you need that for oplog.
-      mongoCommand(config, kj::str(
+      mongoCommand(config, fdBundle, kj::str(
           "rs.initiate({_id: 'ssrs', members: [{_id: 0, host: 'localhost:",
           config.mongoPort, "'}]})"));
 
@@ -1749,9 +2187,9 @@ private:
 
       // Create the mongo user.
       auto command = kj::str(
-        "db.addUser({user: \"sandstorm\", pwd: \"", password, "\", "
+        "db.createUser({user: \"sandstorm\", pwd: \"", password, "\", "
         "roles: [\"readWriteAnyDatabase\",\"userAdminAnyDatabase\",\"dbAdminAnyDatabase\"]})");
-      mongoCommand(config, command, "admin");
+      mongoCommand(config, fdBundle, command, "admin");
 
       // Store the password.
       auto outFd = raiiOpen("/var/mongo/passwd", O_WRONLY | O_CREAT | O_EXCL, 0640);
@@ -1760,10 +2198,82 @@ private:
     }
   }
 
-  pid_t startNode(const Config& config) {
-    pid_t result;
-    KJ_SYSCALL(result = fork());
-    if (result == 0) {
+  pid_t startBackend(const Config& config, FdBundle& fdBundle) {
+    int pipeFds[2];
+    KJ_SYSCALL(pipe2(pipeFds, O_CLOEXEC));
+    kj::AutoCloseFd inPipe(pipeFds[0]);
+    kj::AutoCloseFd outPipe(pipeFds[1]);
+
+    Subprocess process([&]() -> int {
+      inPipe = nullptr;
+      fdBundle.closeAll();
+
+      // Mainly to cause Cap'n Proto to log exceptions being returned over RPC so we can see the
+      // stack traces.
+      kj::_::Debug::setLogLevel(kj::LogSeverity::INFO);
+
+      kj::StringPtr socketPath = Backend::SOCKET_PATH;
+      sandstorm::recursivelyCreateParent(socketPath);
+      unlink(socketPath.cStr());
+
+      auto io = kj::setupAsyncIo();
+      auto& network = io.provider->getNetwork();
+      auto listener = network.parseAddress(kj::str("unix:", socketPath))
+          .wait(io.waitScope)->listen();
+
+      if (runningAsRoot) {
+        // Make socket available to server user.
+        KJ_SYSCALL(chmod(socketPath.cStr(), 0770));
+        KJ_SYSCALL(chown(socketPath.cStr(), 0, config.uids.gid));
+
+        // Also make the socket parent directory available to user.
+        KJ_IF_MAYBE(pos, socketPath.findLast('/')) {
+          kj::String parent = kj::heapString(socketPath.slice(0, *pos));
+          KJ_SYSCALL(chmod(parent.cStr(), 0770));
+          KJ_SYSCALL(chown(parent.cStr(), 0, config.uids.gid));
+        }
+      }
+
+      // If we're not running as root, we have to use user namespaces. Otherwise, dynamically
+      // check if they're available. If not, we'll need to pass superuser privileges on to the
+      // backend.
+      bool avoidUserns = runningAsRoot && !isUserNsAvailable();
+      kj::Maybe<uid_t> sandboxUid;
+      if (avoidUserns) sandboxUid = config.uids.uid;
+
+      dropPrivs(config.uids, avoidUserns);
+      clearSignalMask();
+
+      auto paf = kj::newPromiseAndFulfiller<Backend::Client>();
+      TwoPartyServerWithClientBootstrap server(kj::mv(paf.promise));
+      paf.fulfiller->fulfill(kj::heap<BackendImpl>(*io.lowLevelProvider, network,
+        server.getBootstrap().castAs<SandstormCoreFactory>(), sandboxUid));
+
+      // Signal readiness.
+      write(outPipe, "ready", 5);
+      outPipe = nullptr;
+
+      server.listen(kj::mv(listener))
+            // Rotate logs, keeping 1-2MB worth. We do this in the backend process mainly because
+            // it is the only asynchronous process in run-bundle.c++.
+            .exclusiveJoin(rotateLog(io.provider->getTimer(),
+                                     STDERR_FILENO, "/var/log/sandstorm.log", 1u << 20))
+            .wait(io.waitScope);
+      KJ_UNREACHABLE;
+    });
+
+    outPipe = nullptr;
+    KJ_ASSERT(sandstorm::readAll(inPipe) == "ready", "starting back-end failed");
+
+    pid_t result = process.getPid();
+    process.detach();
+    return result;
+  }
+
+  pid_t startNode(const Config& config, FdBundle& fdBundle) {
+    Subprocess process([&]() -> int {
+      fdBundle.prepareInheritedFds();
+
       dropPrivs(config.uids);
       clearSignalMask();
 
@@ -1782,7 +2292,11 @@ private:
             true));
       }
 
-      KJ_SYSCALL(setenv("PORT", kj::str(config.port).cStr(), true));
+      KJ_SYSCALL(setenv("PORT", kj::strArray(config.ports, ",").cStr(), true));
+      KJ_IF_MAYBE(httpsPort, config.httpsPort) {
+        KJ_SYSCALL(setenv("HTTPS_PORT", kj::str(*httpsPort).cStr(), true));
+      }
+
       KJ_SYSCALL(setenv("MONGO_URL",
           kj::str("mongodb://", authPrefix, "127.0.0.1:", config.mongoPort,
                   "/meteor", authSuffix).cStr(),
@@ -1792,11 +2306,21 @@ private:
         KJ_SYSCALL(setenv("MAIL_URL", config.mailUrl.cStr(), true));
       }
       if (config.rootUrl == nullptr) {
-        if (config.port == 80) {
-          KJ_SYSCALL(setenv("ROOT_URL", kj::str("http://", config.bindIp).cStr(), true));
+        kj::StringPtr scheme;
+        uint defaultPort;
+
+        if (config.httpsPort == nullptr) {
+          scheme = "http://";
+          defaultPort = 80;
+        } else {
+          scheme = "https://";
+          defaultPort = 443;
+        }
+        if (config.ports[0] == defaultPort) {
+          KJ_SYSCALL(setenv("ROOT_URL", kj::str(scheme, config.bindIp).cStr(), true));
         } else {
           KJ_SYSCALL(setenv("ROOT_URL",
-              kj::str("http://", config.bindIp, ":", config.port).cStr(), true));
+              kj::str(scheme, config.bindIp, ":", config.ports[0]).cStr(), true));
         }
       } else {
         KJ_SYSCALL(setenv("ROOT_URL", config.rootUrl.cStr(), true));
@@ -1815,18 +2339,25 @@ private:
         buildstamp = kj::str(SANDSTORM_BUILD);
       }
 
-      KJ_SYSCALL(setenv("METEOR_SETTINGS", kj::str(
+      kj::String settingsString = kj::str(
           "{\"public\":{\"build\":", buildstamp,
-          ", \"kernelTooOld\":", kernelNewEnough ? "false" : "true",
           ", \"allowDemoAccounts\":", config.allowDemoAccounts ? "true" : "false",
           ", \"allowDevAccounts\":", config.allowDevAccounts ? "true" : "false",
           ", \"isTesting\":", config.isTesting ? "true" : "false",
-          ", \"wildcardHost\":\"", config.wildcardHost, "\"",
-          "}}").cStr(), true));
-      KJ_SYSCALL(execl("/bin/node", "/bin/node", "main.js", EXEC_END_ARGS));
+          ", \"hideTroubleshooting\":", config.hideTroubleshooting ? "true" : "false",
+          ", \"wildcardHost\":\"", config.wildcardHost, "\"");
+      if (config.sandcatsHostname.size() > 0) {
+          settingsString = kj::str(settingsString,
+            ", \"sandcatsHostname\":\"", config.sandcatsHostname, "\"");
+      }
+      settingsString = kj::str(settingsString, "}}");
+      KJ_SYSCALL(setenv("METEOR_SETTINGS", settingsString.cStr(), true));
+      KJ_SYSCALL(execl("/bin/node", "/bin/node", "sandstorm-main.js", EXEC_END_ARGS));
       KJ_UNREACHABLE;
-    }
+    });
 
+    pid_t result = process.getPid();
+    process.detach();
     return result;
   }
 
@@ -1882,15 +2413,6 @@ private:
   }
 
   bool checkForUpdates(kj::StringPtr channel, kj::StringPtr type, const Config& config) {
-    if (!kernelNewEnough) {
-      context.warning(
-          "Refusing to update because kernel is too old or unprivileged user namespaces are "
-          "disabled. You need at least kernel version 3.13 and must set the "
-          "kernel.unprivileged_userns_clone sysctl (if your system has it) to 1. If in doubt, "
-          "re-run the Sandstorm installer for help.");
-      return false;
-    }
-
     // GET install.sandstorm.io/$channel?from=$oldBuild&type=[manual|startup|daily]
     //     -> result is build number
     context.warning(kj::str("Checking for updates on channel ", channel, "..."));
@@ -1915,17 +2437,56 @@ private:
       return false;
     }
 
-    // Start http request to download bundle.
+    // Download bundle to temporary file.
     auto url = kj::str("https://dl.sandstorm.io/sandstorm-", targetBuild, ".tar.xz");
+    auto file = openTemporary("/var/tmp/sandstorm-update");
     context.warning(kj::str("Downloading: ", url));
-    auto download = kj::heap<CurlRequest>(url);
-    int fd = download->getPipe();
-    unpackUpdate(fd, kj::mv(download), targetBuild);
+    CurlRequest(url, file);
+    KJ_SYSCALL(lseek(file, 0, SEEK_SET));
+
+    // Verify signature.
+    {
+      context.warning("Checking signature...");
+      KJ_ON_SCOPE_FAILURE(context.warning(
+          "*** Aborting update because signature check failed! Most likely this is due to a "
+          "network glitch, but if you suspect an attack, notify security@sandstorm.io."));
+
+      // Download and parse signature file for this update.
+      capnp::StreamFdMessageReader signatureMessage(
+          CurlRequest(kj::str(url, ".update-sig")).getPipe());
+      auto sigs = signatureMessage.getRoot<UpdateSignature>().getSignatures();
+
+      // Always verify using the *last* key in updatePublicKeys, as it is the most recent.
+      uint keyIndex = UPDATE_PUBLIC_KEYS->size() - 1;
+      PublicSigningKey::Reader key = (*UPDATE_PUBLIC_KEYS)[keyIndex];
+      KJ_ASSERT(sigs.size() > keyIndex,
+          "signature is missing the most recent signing key");
+      Signature::Reader signature = sigs[keyIndex];
+
+      // mmap the file and check the signature.
+      MemoryMapping mapping(file, "(update tarball)");
+      capnp::Data::Reader data = mapping;
+      KJ_ASSERT(crypto_sign_ed25519_verify_detached(
+          structToBytes(signature, crypto_sign_ed25519_BYTES),
+          data.begin(), data.size(),
+          structToBytes(key, crypto_sign_ed25519_PUBLICKEYBYTES)) == 0,
+          "signature is invalid");
+
+      context.warning("Signature is valid.");
+    }
+
+    unpackUpdate(file, targetBuild);
+
     return true;
   }
 
-  void unpackUpdate(int bundleFd, kj::Maybe<kj::Own<CurlRequest>> curlRequest = nullptr,
-                    uint expectedBuild = 0) {
+  const byte* structToBytes(capnp::AnyStruct::Reader reader, size_t size) {
+    auto data = reader.getDataSection();
+    KJ_REQUIRE(data.size() >= size);
+    return data.begin();
+  }
+
+  void unpackUpdate(int bundleFd, uint expectedBuild = 0) {
     char tmpdir[] = "../downloading.XXXXXX";
     if (mkdtemp(tmpdir) != tmpdir) {
       KJ_FAIL_SYSCALL("mkdtemp", errno);
@@ -1939,9 +2500,6 @@ private:
       KJ_SYSCALL(execlp("tar", "tar", "Jxo", EXEC_END_ARGS));
       KJ_UNREACHABLE;
     }
-
-    // Make sure to report CURL status before tar status.
-    curlRequest = nullptr;
 
     int tarStatus;
     KJ_SYSCALL(waitpid(tarPid, &tarStatus, 0));
@@ -1983,7 +2541,7 @@ private:
     KJ_SYSCALL(rename(tmpLink.cStr(), "../latest"));
   }
 
-  pid_t startUpdater(const Config& config, bool isRetry) {
+  pid_t startUpdater(const Config& config, FdBundle& fdBundle, bool isRetry) {
     if (config.updateChannel == nullptr) {
       context.warning("WARNING: Auto-updates are disabled by config.");
       return 0;
@@ -1994,6 +2552,7 @@ private:
     } else {
       pid_t pid = fork();
       if (pid == 0) {
+        fdBundle.closeAll();
         doUpdateLoop(config.updateChannel, isRetry, config);
         KJ_UNREACHABLE;
       }
@@ -2040,9 +2599,11 @@ private:
     }
   }
 
-  [[noreturn]] void restartForUpdate(int pidfileFd) {
+  [[noreturn]] void restartForUpdate(int pidfileFd, FdBundle& fdBundle) {
     // Change pidfile to not close on exec, since we want it to live through the following exec!
     KJ_SYSCALL(fcntl(pidfileFd, F_SETFD, 0));
+
+    auto inheritArgs = fdBundle.prepareForContinue();
 
     // Create arg list.
     kj::Vector<const char*> argv;
@@ -2053,6 +2614,9 @@ private:
     }
     auto pidfileFdStr = kj::str(pidfileFd);
     argv.add(pidfileFdStr.cStr());
+    for (auto& a: inheritArgs) {
+      argv.add(a.cStr());
+    }
     argv.add(EXEC_END_ARGS);
 
     // Exec the new version with our magic "continue".
@@ -2089,6 +2653,41 @@ private:
     }
   }
 
+  void fixSandcatsPermissions(const Config& config) {
+    // An older version of the sandcats installer left various sandcats-related files around owned
+    // by root, rather than the sandstorm server user.
+    // var/sandcats should be 0700, with corrected owner/group
+    if (access("../var/sandcats", F_OK) == 0) {
+        setOwnerGroupAndMode(kj::str("../var/sandcats"), 0700, config.uids.uid, config.uids.gid);
+    }
+
+    // Same issue with https directory & its subdirectories.
+    kj::String httpsBaseDir = kj::str("../var/sandcats/https");
+    if (access(httpsBaseDir.cStr(), F_OK) == 0) {
+      setOwnerGroupAndMode(httpsBaseDir, 0700, config.uids.uid, config.uids.gid);
+
+      kj::Array<kj::String> entries = listDirectory(kj::str(httpsBaseDir));
+      for (size_t i = 0; i < entries.size(); i++) {
+        setOwnerGroupAndMode(kj::str(httpsBaseDir, "/", entries[i]), 0700, config.uids.uid, config.uids.gid);
+      }
+    }
+
+    // var/sandcats/{register-log,id_rsa{,.pub,private_combined}} should each be 0640, with corrected
+    // owner/group
+    static const char* const files[] = {"register-log", "id_rsa", "id_rsa.pub", "id_rsa.private_combined"};
+    for (auto f : files) {
+      auto path = kj::str("../var/sandcats/", f);
+      if (access(path.cStr(), F_OK) == 0) {
+        setOwnerGroupAndMode(path, 0640, config.uids.uid, config.uids.gid);
+      }
+    }
+  }
+
+  void setOwnerGroupAndMode(const kj::String& path, mode_t mode, uid_t owner, uid_t group) {
+    KJ_SYSCALL(chmod(path.cStr(), mode));
+    KJ_SYSCALL(chown(path.cStr(), owner, group));
+  }
+
   kj::AutoCloseFd connectToDevDaemon() {
     int sock_;
     KJ_SYSCALL(sock_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -2104,7 +2703,7 @@ private:
   }
 
   [[noreturn]] void runDevDaemon(const Config& config) {
-    clearDevApps(config);
+    clearDevPackages(config);
 
     // Make sure socket directory exists (since the installer doesn't create it).
     if (mkdir("/var/sandstorm/socket", 0770) == 0) {
@@ -2156,69 +2755,11 @@ private:
   static constexpr kj::byte DEVMODE_COMMAND_CONNECT = 1;
   // Command code sent by `sandstorm dev` command, which is invoked by `spk dev`.
 
-  static constexpr kj::byte DEVMODE_COMMAND_GETNS = 2;
-  // Command code sent by sandstorm-supervisor when it needs to enter our namespace.
-  //
-  // TODO(cleanup): This constant is also defined in supervisor-main.c++. Share them.
-
-  static constexpr kj::byte DEVMODE_COMMAND_SUPERVISE = 3;
-  // Command code sent by `sandstorm supervise` command, which is invoked by the front-end when
-  // running in meteor dev mode (outside of the sandbox) in order to start an app. The front-end
-  // can't just invoke sandstorm-supervisor directly in this case since it's not in the proper
-  // namespace. This command must be followed by three file descriptors (to represent stdin,
-  // stdout, stderr), a series of NUL-terminated strings representing the arguments, and then
-  // EOF.
-
   [[noreturn]] void runDevSession(const Config& config, kj::AutoCloseFd internalFd) {
     auto exception = kj::runCatchingExceptions([&]() {
       // When someone connects, we expect them to pass us a one-byte command code.
       kj::byte commandCode;
       kj::FdInputStream((int)internalFd).read(&commandCode, 1);
-      if (commandCode == DEVMODE_COMMAND_GETNS) {
-        // Oh, they just want to know our namespace.
-        auto nsfd = raiiOpen("/proc/self/ns/mnt", O_RDONLY);
-        sendFd(internalFd, nsfd);
-        return;
-      } else if (commandCode == DEVMODE_COMMAND_SUPERVISE) {
-        // Oh, they want us to run a sandstorm-supervisor.
-
-        // Receive the standard FDs and dup2() them into place.
-        KJ_SYSCALL(dup2(receiveFd(internalFd), STDIN_FILENO));
-        KJ_SYSCALL(dup2(receiveFd(internalFd), STDOUT_FILENO));
-        KJ_SYSCALL(dup2(receiveFd(internalFd), STDERR_FILENO));
-
-        // Re-enable child reaping.
-        KJ_SYSCALL(signal(SIGCHLD, SIG_DFL));
-
-        // Supervisor should run unprivileged.
-        dropPrivs(config.uids);
-
-        // Compute args.
-        auto args = readAll(internalFd);
-        kj::StringPtr argsPtr = args;
-
-        kj::Vector<const char*> argv;
-        argv.add("/bin/sandstorm-supervisor");
-        while (argsPtr.size() > 0) {
-          argv.add(argsPtr.begin());
-          argsPtr = argsPtr.slice(KJ_ASSERT_NONNULL(
-              argsPtr.findFirst('\0'), "Invalid args pack; each arg must end with '\0'!") + 1);
-        }
-        argv.add(nullptr);
-
-        // Execute.
-        pid_t child;
-        KJ_SYSCALL(child = fork());
-        if (child == 0) {
-          KJ_SYSCALL(execv(argv[0], const_cast<char**>(argv.begin())));
-          KJ_UNREACHABLE;
-        } else {
-          int status;
-          KJ_SYSCALL(waitpid(child, &status, 0));
-          kj::FdOutputStream((int)internalFd).write(&status, sizeof(status));
-          _exit(0);
-        }
-      }
 
       KJ_REQUIRE(commandCode == DEVMODE_COMMAND_CONNECT);
       context.warning("** Accepted new dev session connection...");
@@ -2244,6 +2785,16 @@ private:
         appId = kj::mv(*line);
       } else {
         KJ_FAIL_ASSERT("Expected app ID.");
+      }
+
+      bool mountProc = false;
+      KJ_IF_MAYBE(line, readLine(input)) {
+        kj::String mountProcLine = kj::mv(*line);
+        if (mountProcLine == "1") {
+          mountProc = true;
+        }
+      } else {
+        KJ_FAIL_ASSERT("Expected value of '1' or '0' for mountProc.");
       }
 
       for (char c: appId) {
@@ -2277,44 +2828,36 @@ private:
       sendFd(fd, fuseFd);
       fuseFd = nullptr;
 
-      // Kill all sandstorm-supervisor processes to force a reload of the app. (In theory we could
-      // try to only kill supervisors of the specific app we're overriding, but that would take
-      // some extra work to figure out. Killing them all shouldn't hurt much.)
-      killall("/bin/sandstorm-supervisor");
+      capnp::ReaderOptions manifestLimits;
+      manifestLimits.traversalLimitInWords = spk::Manifest::SIZE_LIMIT_IN_WORDS;
 
       {
         // Read the manifest.
         capnp::StreamFdMessageReader reader(
-            raiiOpen(kj::str(dir, "/sandstorm-manifest"), O_RDONLY));
+            raiiOpen(kj::str(dir, "/sandstorm-manifest"), O_RDONLY), manifestLimits);
 
         // Notify the front-end that the app exists.
-        insertDevApp(config, appId, pkgId, reader.getRoot<spk::Manifest>());
+        insertDevPackage(config, appId, mountProc, pkgId, reader.getRoot<spk::Manifest>());
       }
 
       {
-        KJ_DEFER(removeDevApp(config, appId));
+        KJ_DEFER(removeDevPackage(config, pkgId));
 
         for (;;) {
           KJ_IF_MAYBE(line, readLine(input)) {
             if (*line == "restart") {
               // Re-read the manifest.
               capnp::StreamFdMessageReader reader(
-                  raiiOpen(kj::str(dir, "/sandstorm-manifest"), O_RDONLY));
-
-              // Kill all the supervisors again to force a reload of the app.
-              killall("/bin/sandstorm-supervisor");
+                  raiiOpen(kj::str(dir, "/sandstorm-manifest"), O_RDONLY), manifestLimits);
 
               // Notify front-end that the app changed.
-              updateDevApp(config, appId, reader.getRoot<spk::Manifest>());
+              updateDevPackage(config, pkgId, reader.getRoot<spk::Manifest>());
             }
           } else {
             break;
           }
         }
       }
-
-      // Kill all the supervisors again to shut down the app before we unmount it.
-      killall("/bin/sandstorm-supervisor");
     });
 
     KJ_IF_MAYBE(e, exception) {
@@ -2324,80 +2867,93 @@ private:
     }
   }
 
-  void killall(kj::StringPtr command) {
-    for (auto& file: listDirectory("/proc")) {
-      KJ_IF_MAYBE(pid, parseUInt(file, 10)) {
-        char buf[command.size() + 1];
-        char* bufPtr = buf;  // Clang doesn't like capturing variable-width arrays.
-
-        auto maybeFd = raiiOpenIfExists(kj::str("/proc/", file, "/cmdline"), O_RDONLY);
-        // No big deal if it doesn't exist. Probably the pid disappeared while we were listing
-        // the directory.
-
-        KJ_IF_MAYBE(fd, maybeFd) {
-          kj::FdInputStream stream(kj::mv(*fd));
-          size_t n = stream.tryRead(bufPtr, sizeof(buf), sizeof(buf));
-          if (n == sizeof(buf) && memcmp(command.begin(), buf, n) == 0) {
-            // An exact match, including the terminating NUL byte. Kill the process!
-            KJ_SYSCALL(kill(*pid, SIGTERM));
-          }
-        }
-      }
+  class MongoJsonBinaryHandler: public capnp::JsonCodec::Handler<capnp::Data> {
+  public:
+    void encode(const capnp::JsonCodec& codec, capnp::Data::Reader input,
+                capnp::JsonValue::Builder output) const override {
+      auto call = output.initCall();
+      call.setFunction("BinData");
+      auto params = call.initParams(2);
+      params[0].setNumber(0);
+      params[1].setString(base64Encode(input, false));
     }
+
+    capnp::Orphan<capnp::Data> decode(
+        const capnp::JsonCodec& codec, capnp::JsonValue::Reader input,
+        capnp::Orphanage orphanage) const override {
+      KJ_UNIMPLEMENTED("MongoJsonBinaryHandler::decode");
+    }
+  };
+
+  template <typename T>
+  kj::StringTree toMongoJson(T&& value) {
+    capnp::JsonCodec json;
+    MongoJsonBinaryHandler binHandler;
+    json.addTypeHandler(binHandler);
+    return json.encode(kj::fwd<T>(value));
   }
 
-  void insertDevApp(const Config& config, kj::StringPtr appId, kj::StringPtr pkgId,
-                    spk::Manifest::Reader manifest) {
-    mongoCommand(config, kj::str(
-        "db.devapps.insert({"
-          "_id:\"", appId, "\","
-          "packageId:\"", pkgId, "\","
+  void insertDevPackage(const Config& config, kj::StringPtr appId, bool mountProc,
+                        kj::StringPtr pkgId, spk::Manifest::Reader manifest) {
+    FdBundle fakeBundle(nullptr);
+    mongoCommand(config, fakeBundle, kj::str(
+        "db.devpackages.insert({"
+          "_id:\"", pkgId, "\","
+          "appId:\"", appId, "\","
           "timestamp:", time(nullptr), ","
-          "manifest:", toJson(manifest),
+          "manifest:", toMongoJson(manifest), ","
+          "mountProc:", mountProc ? "true" : "false",
         "})"));
   }
 
-  void updateDevApp(const Config& config, kj::StringPtr appId, spk::Manifest::Reader manifest) {
-    mongoCommand(config, kj::str(
-        "db.devapps.update({_id:\"", appId, "\"}, {$set: {"
+  void updateDevPackage(const Config& config, kj::StringPtr pkgId, spk::Manifest::Reader manifest) {
+    FdBundle fakeBundle(nullptr);
+    mongoCommand(config, fakeBundle, kj::str(
+        "db.devpackages.update({_id:\"", pkgId, "\"}, {$set: {"
           "timestamp:", time(nullptr), ","
-          "manifest:", toJson(manifest),
+          "manifest:", toMongoJson(manifest),
         "}})"));
   }
 
-  void removeDevApp(const Config& config, kj::StringPtr appId) {
-    mongoCommand(config, kj::str(
-        "db.devapps.remove({_id:\"", appId, "\"})"));
+  void removeDevPackage(const Config& config, kj::StringPtr pkgId) {
+    FdBundle fakeBundle(nullptr);
+    mongoCommand(config, fakeBundle, kj::str(
+        "db.devpackages.remove({_id:\"", pkgId, "\"})"));
   }
 
-  void clearDevApps(const Config& config) {
-    mongoCommand(config, kj::str("db.devapps.remove({})"));
+  void clearDevPackages(const Config& config) {
+    FdBundle fakeBundle(nullptr);
+    mongoCommand(config, fakeBundle, kj::str("db.devpackages.remove({})"));
   }
 
-  void mongoCommand(const Config& config, kj::StringPtr command, kj::StringPtr db = "meteor") {
-    pid_t pid = fork();
-    if (pid == 0) {
-      // We don't want to unwind the stack in this subprocess.
-      KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
-        // Don't run as root.
-        dropPrivs(config.uids);
-
-        execMongoClient(config, {"--quiet", "--eval", command }, db);
-      })) {
-        context.exitError(kj::str(*exception));
-      }
-
-      KJ_UNREACHABLE;
+  void mongoCommand(const Config& config, FdBundle& fdBundle,
+                    kj::StringPtr command, kj::StringPtr db = "meteor") {
+    char commandFile[] = "/tmp/mongo-command.XXXXXX";
+    int commandRawFd;
+    KJ_SYSCALL(commandRawFd = mkstemp(commandFile));
+    kj::AutoCloseFd commandFd(commandRawFd);
+    KJ_DEFER(unlink(commandFile));
+    if (runningAsRoot) {
+      KJ_SYSCALL(fchown(commandRawFd, -1, config.uids.gid));
+      KJ_SYSCALL(fchmod(commandRawFd, 0660));
     }
+    kj::FdOutputStream(kj::mv(commandFd)).write(command.begin(), command.size());
 
-    int status;
-    KJ_SYSCALL(waitpid(pid, &status, 0)) { return; }
-    KJ_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-              "mongo command failed", command) { return; }
+    Subprocess process([&]() -> int {
+      fdBundle.closeAll();
+
+      // Don't run as root.
+      dropPrivs(config.uids);
+
+      execMongoClient(config, {"--quiet"}, {commandFile}, db);
+      KJ_UNREACHABLE;
+    });
+    process.waitForSuccess();
   }
 
   [[noreturn]] void execMongoClient(const Config& config,
-        std::initializer_list<kj::StringPtr> addlArgs,
+        std::initializer_list<kj::StringPtr> optionArgs,
+        std::initializer_list<kj::StringPtr> fileArgs,
         kj::StringPtr dbName = "meteor") {
     auto db = kj::str("127.0.0.1:", config.mongoPort, "/", dbName);
 
@@ -2406,23 +2962,27 @@ private:
 
     // If /var/mongo/passwd exists, we interpret it as containing the password for a Mongo user
     // "sandstorm", and assume we are expected to log in as this user.
-    kj::String password;
+    kj::String passwordArg;
     if (access("/var/mongo/passwd", F_OK) == 0) {
-      password = trim(readAll(raiiOpen("/var/mongo/passwd", O_RDONLY)));
+      passwordArg = kj::str("--password=", trim(readAll(raiiOpen("/var/mongo/passwd", O_RDONLY))));
 
       args.add("-u");
       args.add("sandstorm");
-      args.add("-p");
-      args.add(password.cStr());
+      args.add(passwordArg.cStr());
       args.add("--authenticationDatabase");
       args.add("admin");
     }
 
-    for (auto& arg: addlArgs) {
+    for (auto& arg: optionArgs) {
       args.add(arg.cStr());
     }
 
     args.add(db.cStr());
+
+    for (auto& arg: fileArgs) {
+      args.add(arg.cStr());
+    }
+
     args.add(nullptr);
 
     // OK, run the Mongo client!
@@ -2458,19 +3018,9 @@ private:
       return true;
     }
   }
-
-  kj::MainBuilder::Validity setDevtoolsBindir(kj::StringPtr arg) {
-    if (access(arg.cStr(), F_OK) != 0) {
-      return "not found";
-    }
-    devtoolsBindir = arg;
-    return true;
-  }
 };
 
 constexpr kj::byte RunBundleMain::DEVMODE_COMMAND_CONNECT;
-constexpr kj::byte RunBundleMain::DEVMODE_COMMAND_GETNS;
-constexpr kj::byte RunBundleMain::DEVMODE_COMMAND_SUPERVISE;
 
 }  // namespace sandstorm
 

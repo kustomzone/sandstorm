@@ -15,38 +15,79 @@ All files not explicitly mentioned below
     License: Apache 2.0
     License text: See below
 
-shell/public/opensans-light.woff
-shell/public/opensans-semibold.woff
-    What: Open Sans font
-    Source URL: https://www.google.com/fonts/specimen/Open+Sans
-    Copyright: Google, Inc.
-    License: Apache 2.0
-    License URL: http://www.apache.org/licenses/LICENSE-2.0.html
+shell/public/spinner_96.gif
+    What: GIF spinner
+    Source URL: https://github.com/sjhcockrell/spinners
+    License: MIT
+    License URL: https://github.com/sjhcockrell/spinners/blob/master/README.md
 
-icons/close.svg
-icons/download.svg
-icons/edit.svg
-icons/restart.svg
-icons/trash.svg
-icons/wrench.svg
-    What: Icons by Naomi Atkinson from The Noun Project
-    Source URL: http://www.thenounproject.com/naomiatkinson/uploads/
-    Copyright: Naomi Atkinson
-    License: CC BY 3.0
-    License URL: http://creativecommons.org/licenses/by/3.0/us/
+shell/public/clipboard.js
+    What: clipboard.js
+    Copyright: Zeno Rocha
+    Source URL: https://github.com/zenorocha/clipboard.js/
+    License: MIT
+    License URL: https://github.com/zenorocha/clipboard.js/blob/master/readme.md
+                 (at bottom)
 
-icons/key.svg
-    What: Key icon
-    Source URL: http://thenounproject.com/term/key/655/
-    Copyright: Public domain
+shell/public/fonts/WOFF/OTF/SourceSansPro-Regular.otf.woff
+shell/public/fonts/WOFF/OTF/SourceSansPro-It.otf.woff
+shell/public/fonts/WOFF/OTF/SourceSansPro-Semibold.otf.woff
+shell/public/fonts/WOFF/OTF/SourceSansPro-SemiboldIt.otf.woff
+shell/public/fonts/WOFF/OTF/SourceSansPro-Bold.otf.woff
+shell/public/fonts/WOFF/OTF/SourceSansPro-BoldIt.otf.woff
+    What: Source Sans Pro font
+    Source URL: https://github.com/adobe-fonts/source-sans-pro
+    Copyright: Adobe Systems Incorporated
+    License: SIL Open Font License, Version 1.1
+    License URL: https://github.com/adobe-fonts/source-sans-pro/blob/master/LICENSE.txt
 
-shell/client/ansi-up.js
+shell/client/accounts/login-buttons.html
+shell/client/accounts/login-buttons.js
+shell/client/accounts/login-buttons-session.js
+    What: forked from accounts-ui/accounts-ui-unstyled
+    Source URL: https://github.com/meteor/meteor
+    Copyright: Meteor Development Group
+    License: MIT
+    License URL: https://github.com/meteor/meteor/blob/devel/LICENSE.txt
+
+shell/client/vendor/ansi-up.js
     What: ansi_up library (converts ANSI escape codes to HTML)
     Source URL: http://github.com/drudru/ansi_up
     Copyright: Dru Nelson
     License: MIT
     License URL: https://github.com/drudru/ansi_up/blob/master/Readme.md
                  (at bottom)
+
+shell/packages/sandstorm-identicons/identicon.js
+    What: identicon.js
+    Source URL: https://github.com/stewartlord/identicon.js
+    Copyright: Stewart Lord
+    License: BSD 2-clause
+    License URL: http://opensource.org/licenses/bsd-license.php
+
+shell/packages/sandstorm-identicons/pnglib.js
+    What: PNGlib
+    Source URL: https://github.com/stewartlord/pnglib.js
+    Copyright: Robert Eisele
+    License: BSD 2-clause
+    License URL: http://opensource.org/licenses/bsd-license.php
+
+shell/imports/client/accounts/ldap/ldap-client.js
+shell/server/accounts/ldap/ldap-server.js
+    What: forked from Meteor accounts-ldap package
+    Source URL: https://github.com/typ90/meteor-accounts-ldap
+    Copyright: Eric Typaldos
+    License: MIT
+    License URL: https://github.com/typ90/meteor-accounts-ldap/blob/master/LICENSE
+
+shell/imports/client/accounts/saml/saml-client.js
+shell/imports/server/accounts/saml-utils.js
+shell/server/accounts/saml/saml-server.js
+    What: forked from Meteor accounts-saml package
+    Source URL: https://github.com/nate-strauser/meteor-accounts-saml
+    Copyright: Nathan Strauser
+    License: MIT
+    License URL: https://github.com/nate-strauser/meteor-accounts-saml/blob/master/LICENSE
 
 src/joyent-http/*
     What: Node.js HTTP parsing library
@@ -55,12 +96,21 @@ src/joyent-http/*
     License: MIT
     License text: See comments at top of source files.
 
-base64 handling in src/sandstorm/legacy-bridge.c++
+base64 handling in src/sandstorm/sandstorm-http-bridge.c++
     What: Code copied from libb64
     Source URL: http://libb64.sourceforge.net/
     Copyright: Public Domain (authored by Chris Venter)
     License: Public Domain
     License text: http://creativecommons.org/licenses/publicdomain/
+
+localedata-C
+    What: A C locale supporting UTF-8, based on Debian and Fedora's C.UTF-8 locales
+    Source URLs:
+      http://sources.debian.net/data/main/g/glibc/2.19-22/localedata/locales/C
+      https://lists.stg.fedoraproject.org/archives/list/glibc%40lists.fedoraproject.org/message/RAIVZBJH55SKKLPSR6AX7RJOIUG3BF57/attachment/2/0001-Add-a-C.UTF-8-locale.patch
+    Copyright: Aurelien Jarno (Debian), Mike Fabian (Fedora)
+    License: LGPL Version 2.1 or later
+    License text: http://opensource.org/licenses/LGPL-2.1
 
 Trademarks
 ==========
@@ -270,4 +320,3 @@ Google's Android.
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-
